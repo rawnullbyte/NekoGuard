@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 const CHALLENGE_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/challenge.min.html"));
 const PORT: u16 = 3000;
 const MAX_VERIFY_BODY: usize = 512;
-const CHALLENGE_TTL: Duration = Duration::from_secs(300);
+const CHALLENGE_TTL: Duration = Duration::from_secs(300); // 5 min
 const TEMP_TTL: Duration = Duration::from_secs(1800); // 30 min
 
 type RespBody = BoxBody<Bytes, hyper::Error>;
