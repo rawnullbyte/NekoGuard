@@ -125,6 +125,16 @@ fn serve_embedded_asset(file_path: &str) -> Response<RespBody> {
     }
 }
 
+fn strip_cookie_domain(cookie: &str) -> String {
+    cookie
+        .split(';')
+        .enumerate()
+        .filter(|(i, part)| *i == 0 || !part.trim().to_lowercase().starts_with("domain="))
+        .map(|(_, part)| part)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 // Proxy
 async fn proxy_to_upstream(
     client: &ProxyClient,
@@ -132,21 +142,43 @@ async fn proxy_to_upstream(
     upstream: &str,
 ) -> Response<RespBody> {
     let (mut parts, body) = req.into_parts();
-    
+
     let upstream_uri: hyper::Uri = match upstream.parse() {
         Ok(u) => u,
         Err(_) => return text_resp(StatusCode::BAD_REQUEST, "Invalid upstream URL"),
     };
-    
+
     let authority = upstream_uri.authority().map(|a| a.as_str()).unwrap_or("");
     let scheme = upstream_uri.scheme_str().unwrap_or("https");
-    
+
     let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let target = format!("{}://{}{}", scheme, authority, pq);
     parts.uri = target.parse().unwrap();
 
     parts.headers.insert("Host", HeaderValue::from_str(authority).unwrap());
-    
+
+    if parts.headers.contains_key("origin") {
+        let new_origin = format!("{}://{}", scheme, authority);
+        if let Ok(val) = HeaderValue::from_str(&new_origin) {
+            parts.headers.insert("origin", val);
+        }
+    }
+
+    if let Some(referer) = parts
+        .headers
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    {
+        if let Ok(ref_uri) = referer.parse::<hyper::Uri>() {
+            let ref_pq = ref_uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+            let new_referer = format!("{}://{}{}", scheme, authority, ref_pq);
+            if let Ok(val) = HeaderValue::from_str(&new_referer) {
+                parts.headers.insert("referer", val);
+            }
+        }
+    }
+
     parts.headers.remove("x-upstream");
     parts.headers.remove("x-real-ip");
 
@@ -155,12 +187,27 @@ async fn proxy_to_upstream(
     match client.request(proxied_req).await {
         Ok(resp) => {
             let (mut rp, rb) = resp.into_parts();
-            
+
             rp.headers.remove("content-security-policy");
             rp.headers.remove("content-security-policy-report-only");
-            
             rp.headers.remove("transfer-encoding");
-            
+
+            let patched: Vec<HeaderValue> = rp
+                .headers
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .map(|s| strip_cookie_domain(s))
+                .filter_map(|s| HeaderValue::from_str(&s).ok())
+                .collect();
+
+            if !patched.is_empty() {
+                rp.headers.remove("set-cookie");
+                for val in patched {
+                    rp.headers.append("set-cookie", val);
+                }
+            }
+
             Response::from_parts(rp, rb.boxed())
         }
         Err(e) => {
