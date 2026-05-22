@@ -131,26 +131,42 @@ async fn proxy_to_upstream(
     req: Request<Incoming>,
     upstream: &str,
 ) -> Response<RespBody> {
-    let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let target = format!("{}{}", upstream.trim_end_matches('/'), pq);
-
-    let target_uri: hyper::Uri = match target.parse() {
-        Ok(u) => u,
-        Err(_) => return text_resp(StatusCode::BAD_REQUEST, "Bad upstream URI"),
-    };
-
     let (mut parts, body) = req.into_parts();
-    parts.uri = target_uri;
-    parts.headers.remove("x-upstream");
-    parts.headers.remove("host"); 
+    
+    let upstream_uri: hyper::Uri = match upstream.parse() {
+        Ok(u) => u,
+        Err(_) => return text_resp(StatusCode::BAD_REQUEST, "Invalid upstream URL"),
+    };
+    
+    let authority = upstream_uri.authority().map(|a| a.as_str()).unwrap_or("");
+    let scheme = upstream_uri.scheme_str().unwrap_or("https");
+    
+    let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let target = format!("{}://{}{}", scheme, authority, pq);
+    parts.uri = target.parse().unwrap();
 
-    match client.request(Request::from_parts(parts, body.boxed())).await {
+    parts.headers.insert("Host", HeaderValue::from_str(authority).unwrap());
+    
+    parts.headers.remove("x-upstream");
+    parts.headers.remove("x-real-ip");
+
+    let proxied_req = Request::from_parts(parts, body);
+
+    match client.request(proxied_req).await {
         Ok(resp) => {
             let (mut rp, rb) = resp.into_parts();
+            
+            rp.headers.remove("content-security-policy");
+            rp.headers.remove("content-security-policy-report-only");
+            
             rp.headers.remove("transfer-encoding");
+            
             Response::from_parts(rp, rb.boxed())
         }
-        Err(_) => text_resp(StatusCode::BAD_GATEWAY, "Upstream unavailable"),
+        Err(e) => {
+            eprintln!("Proxy error: {:?}", e);
+            text_resp(StatusCode::BAD_GATEWAY, "Upstream error")
+        }
     }
 }
 
