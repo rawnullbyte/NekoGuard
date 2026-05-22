@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Making sure you're not a bot!</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      /* Light Theme Variables */
+      --bg-color: #faf7f7;
+      --text-main: #5c5a66;
+      --text-heading: #e07a93;
+      --status-bg: #fff0f3;
+      --status-border: #ffccd5;
+      --status-text: #d65c78;
+      --link-color: #f45b7a;
+      --link-hover: #d64563;
+      --link-border: rgba(244, 91, 122, 0.4);
+      --footer-text: #9996a3;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        /* Dark Theme Variables */
+        --bg-color: #23222b;
+        --text-main: #c4c4cc;
+        --text-heading: #ffb3c6;
+        --status-bg: #2f2d3a;
+        --status-border: #4a4759;
+        --status-text: #ffccd5;
+        --link-color: #ff8fab;
+        --link-hover: #ffc2d1;
+        --link-border: rgba(255, 143, 171, 0.4);
+        --footer-text: #8c8a99;
+      }
+    }
+
+    body {
+      background-color: var(--bg-color);
+      color: var(--text-main);
+      font-family: 'Quicksand', system-ui, -apple-system, sans-serif;
+      margin: 0;
+      padding: 40px 20px;
+      height: 100vh;
+      box-sizing: border-box;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      transition: background-color 0.3s ease, color 0.3s ease;
+    }
+
+    .container {
+      max-width: 800px;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 24px;
+    }
+
+    h1 {
+      font-family: 'Quicksand', sans-serif;
+      font-size: 2.2rem;
+      font-weight: 700;
+      color: var(--text-heading);
+      margin: 0;
+      letter-spacing: -0.5px;
+    }
+
+    .image {
+      width: 220px;
+      height: auto;
+      object-fit: contain;
+      margin: 10px 0;
+    }
+
+    p {
+      margin: 0;
+      line-height: 1.6;
+      color: var(--text-main);
+      font-size: 1.15rem;
+      font-weight: 600;
+    }
+
+    .status-area {
+      font-family: ui-monospace, "SFMono-Regular", monospace;
+      font-size: 1.05rem;
+      color: var(--status-text);
+      background: var(--status-bg);
+      padding: 12px 24px;
+      border-radius: 50px;
+      border: 2px dashed var(--status-border);
+      min-width: 280px;
+    }
+
+    a {
+      color: var(--link-color);
+      text-decoration: none;
+      font-weight: 600;
+      border-bottom: 2px dotted var(--link-border);
+      transition: all 0.2s ease;
+    }
+
+    a:hover {
+      color: var(--link-hover);
+      border-bottom-style: solid;
+      border-bottom-color: var(--link-hover);
+    }
+
+    .footer-text {
+      position: fixed;
+      bottom: 20px;
+      left: 20px;
+      color: var(--footer-text);
+      font-size: 0.95rem;
+      font-weight: 400;
+      margin: 0;
+    }
+
+    .footer-text span {
+      font-family: ui-monospace, "SFMono-Regular", monospace;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container" id="ng" data-challenge="{{CHALLENGE}}" data-bits="{{BITS}}">
+    
+    <h1>Making sure you're not a bot!</h1>
+    
+    <img class="image" src="/__ng/assets/image.png">
+
+    <div class="status-area">
+      Difficulty: <span id="diff-val">--</span> bits | Nonce: <span id="nonce-val">0</span>
+    </div>
+
+    <p>Please wait a moment while we ensure the security of your connection.</p>
+
+  </div>
+
+  <p class="footer-text">Protected by <a href="https://github.com/rawnullbyte/NekoGuard" target="_blank">NekoGuard v<span id="app-version">1.0</span></a></p>
+
+  <script>
+    (async () => {
+      fetch("/__ng/version")
+        .then(res => res.text())
+        .then(ver => document.getElementById("app-version").textContent = ver)
+        .catch(() => {});
+
+      const cfg       = document.getElementById("ng").dataset;
+      const challenge = cfg.challenge;
+      const bits      = parseInt(cfg.bits, 10) || 16; 
+      const enc       = new TextEncoder();
+      
+      const nonceEl   = document.getElementById("nonce-val");
+      const diffEl    = document.getElementById("diff-val");
+      
+      diffEl.textContent = bits;
+
+      async function sha256hex(s) {
+        const buf = await crypto.subtle.digest("SHA-256", enc.encode(s));
+        return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+      }
+
+      function meetsTarget(hash, bits) {
+        const full = Math.floor(bits / 4);
+        const rem  = bits % 4;
+        if (!hash.startsWith("0".repeat(full))) return false;
+        if (rem === 0) return true;
+        return parseInt(hash[full], 16) < (1 << (4 - rem));
+      }
+
+      let nonce = 0;
+
+      while (true) {
+        if (nonce % 500 === 0) {
+          nonceEl.textContent = nonce;
+          await new Promise(r => setTimeout(r, 0));
+        }
+
+        const hash = await sha256hex(challenge + nonce);
+
+        if (meetsTarget(hash, bits)) {
+          nonceEl.textContent = nonce;
+          document.querySelector(".status-area").textContent = "Verification successful! Redirecting…";
+
+          const res = await fetch("/__ng/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ challenge, nonce: String(nonce) }),
+          });
+
+          if (res.ok) location.reload();
+          else document.querySelector(".status-area").textContent = "Verification failed. Please refresh.";
+          return;
+        }
+
+        nonce++;
+      }
+    })();
+  </script>
+</body>
+</html>
