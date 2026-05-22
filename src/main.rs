@@ -150,7 +150,7 @@ async fn proxy_to_upstream(
     parts.headers.remove("x-upstream");
     parts.headers.remove("x-real-ip");
 
-    let proxied_req = Request::from_parts(parts, body);
+    let proxied_req = Request::from_parts(parts, body.map_err(|e| e).boxed());
 
     match client.request(proxied_req).await {
         Ok(resp) => {
