@@ -86,6 +86,7 @@ fn challenge_page(challenge: &str) -> Response<RespBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header("cache-control", "no-store, private")
         .body(Full::new(Bytes::from(html))
             .map_err(|e: Infallible| match e {})
             .boxed())
@@ -222,6 +223,16 @@ async fn handle(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
+    // /__ng/* routes are always handled locally, before any auth or proxy logic.
+    if (path == "/__ng/version") && method == Method::GET {
+        return Ok(text_resp(StatusCode::OK, env!("CARGO_PKG_VERSION")));
+    }
+
+    if path.starts_with("/__ng/assets/") && method == Method::GET {
+        let asset_subpath = &path["/__ng/assets/".len()..];
+        return Ok(serve_embedded_asset(asset_subpath));
+    }
+
     let real_ip: Option<IpAddr> = req
         .headers()
         .get("x-real-ip")
@@ -233,23 +244,6 @@ async fn handle(
         .get("x-upstream")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-
-    if real_ip.map(is_allowed).unwrap_or(false) {
-        return match upstream {
-            Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
-            None => Ok(text_resp(StatusCode::BAD_REQUEST, "Missing X-Upstream header")),
-        };
-    }
-
-    // Unauthenticated Flow
-    if (path == "/__ng/version") && method == Method::GET {
-        return Ok(text_resp(StatusCode::OK, env!("CARGO_PKG_VERSION")));
-    }
-
-    if path.starts_with("/__ng/assets/") && method == Method::GET {
-        let asset_subpath = &path["/__ng/assets/".len()..];
-        return Ok(serve_embedded_asset(asset_subpath));
-    }
 
     if path == "/__ng/verify" && method == Method::POST {
         let bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
@@ -269,6 +263,13 @@ async fn handle(
             allow_ip(ip);
         }
         return Ok(text_resp(StatusCode::OK, "OK"));
+    }
+
+    if real_ip.map(is_allowed).unwrap_or(false) {
+        return match upstream {
+            Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
+            None => Ok(text_resp(StatusCode::BAD_REQUEST, "Missing X-Upstream header")),
+        };
     }
 
     Ok(challenge_page(&pow::new_challenge(CHALLENGE_TTL)))
