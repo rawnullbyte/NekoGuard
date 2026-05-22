@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-pub const DIFFICULTY: u32 = 16;
+pub const DIFFICULTY: u32 = 14;
 
 static MAP: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
 
