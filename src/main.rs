@@ -179,13 +179,6 @@ async fn proxy_to_upstream(
         }
     }
 
-    parts.headers.remove("x-forwarded-host");
-    parts.headers.remove("x-forwarded-for");
-    parts.headers.remove("x-forwarded-proto");
-    parts.headers.remove("x-forwarded-port");
-    parts.headers.remove("forwarded");
-    parts.headers.remove("x-upstream");
-
     let proxied_req = Request::from_parts(parts, body.map_err(|e| e).boxed());
 
     match client.request(proxied_req).await {
