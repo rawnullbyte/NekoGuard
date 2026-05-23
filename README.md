@@ -1,6 +1,6 @@
 # NekoGuard
 
-<img width="1694" height="936" src="https://github.com/user-attachments/assets/7f385fa8-fe6e-4736-bc33-12d1c0294465" />
+<img width="1694" height="936" src="https://github.com/user-attachments/assets/fa1dd96c-e7f5-47b5-9084-64bf65adfdc0" />
 
 # NekoGuard
 
