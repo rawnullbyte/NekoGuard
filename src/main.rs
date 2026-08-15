@@ -1,3 +1,4 @@
+mod contracts;
 mod pow;
 
 use bytes::Bytes;
