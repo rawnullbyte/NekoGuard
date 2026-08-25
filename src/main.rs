@@ -52,25 +52,28 @@ static PERM: LazyLock<HashSet<IpAddr>> = LazyLock::new(|| {
         .collect()
 });
 
-static TEMP: LazyLock<DashMap<IpAddr, Instant>> = LazyLock::new(DashMap::new);
+/// IPs temporarily whitelisted for a fixed duration after solving the PoW.
+static TEMP_WHITELIST: LazyLock<DashMap<IpAddr, Instant>> =
+    LazyLock::new(DashMap::new);
 
-fn is_allowed(ip: IpAddr) -> bool {
+/// Whether an IP is whitelisted — either permanently or temporarily.
+fn is_whitelisted(ip: IpAddr) -> bool {
     if PERM.contains(&ip) {
         return true;
     }
-    let expiry = match TEMP.get(&ip) {
-        Some(r) => *r,
-        None => return false,
-    };
-    if Instant::now() <= expiry {
-        return true;
+    match TEMP_WHITELIST.get(&ip) {
+        Some(expiry) if *expiry > Instant::now() => true,
+        Some(_) => {
+            TEMP_WHITELIST.remove(&ip);
+            false
+        }
+        None => false,
     }
-    TEMP.remove(&ip);
-    false
 }
 
-fn allow_ip(ip: IpAddr) {
-    TEMP.insert(ip, Instant::now() + TEMP_TTL);
+/// Whitelist an IP for TEMP_TTL after a valid PoW solution.
+fn whitelist_temp(ip: IpAddr) {
+    TEMP_WHITELIST.insert(ip, Instant::now() + TEMP_TTL);
 }
 
 
@@ -305,12 +308,12 @@ async fn handle(
         }
 
         if let Some(ip) = real_ip {
-            allow_ip(ip);
+            whitelist_temp(ip);
         }
         return Ok(text_resp(StatusCode::OK, "OK"));
     }
 
-    if real_ip.map(is_allowed).unwrap_or(false) {
+    if real_ip.map(is_whitelisted).unwrap_or(false) {
         return match upstream {
             Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
             None => Ok(text_resp(
@@ -428,7 +431,7 @@ async fn main() {
             tick.tick().await;
             pow::sweep();
             let now = Instant::now();
-            TEMP.retain(|_, exp| now < *exp);
+            TEMP_WHITELIST.retain(|_, exp| now < *exp);
         }
     });
 
