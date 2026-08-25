@@ -219,7 +219,7 @@ async fn proxy_to_upstream(
                 .get_all("set-cookie")
                 .iter()
                 .filter_map(|v| v.to_str().ok())
-                .map(|s| strip_cookie_domain(s))
+                .map(strip_cookie_domain)
                 .filter_map(|s| HeaderValue::from_str(&s).ok())
                 .collect();
 
@@ -300,7 +300,10 @@ async fn handle(
     if real_ip.map(is_allowed).unwrap_or(false) {
         return match upstream {
             Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
-            None => Ok(text_resp(StatusCode::BAD_REQUEST, "Missing X-Upstream header")),
+            None => Ok(text_resp(
+                StatusCode::BAD_REQUEST,
+                "No upstream configured for this Host",
+            )),
         };
     }
 
@@ -375,9 +378,16 @@ async fn main() {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    let client: ProxyClient =
-        Client::builder(TokioExecutor::new()).build(HttpsConnector::new());
-    let client = Arc::new(client);
+    // Upstream pool. Like nginx's default (proxy_ssl_verify off), upstream
+    // certificates are NOT verified: NekoGuard fronts its own TLS for visitors,
+    // and internal backends commonly run self-signed certs on the LAN.
+    let trust_tls = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("failed to build trusting TLS connector");
+    let client: ProxyClient = Client::builder(TokioExecutor::new())
+        .build(HttpsConnector::from((HttpConnector::new(), trust_tls.into())));
+    let clients = Arc::new(client);
 
     tokio::spawn(async {
         let mut tick = tokio::time::interval(Duration::from_secs(600));
@@ -439,7 +449,7 @@ async fn main() {
         let peer_ip = peer.ip();
         let challenge_rustls_config = challenge_rustls_config.clone();
         let default_rustls_config = default_rustls_config.clone();
-        let client = Arc::clone(&client);
+        let clients = Arc::clone(&clients);
 
         tokio::spawn(async move {
             let start_handshake = match LazyConfigAcceptor::new(Default::default(), tcp).await {
@@ -484,7 +494,7 @@ async fn main() {
             let _ = http1::Builder::new()
                 .serve_connection(
                     io,
-                    service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
+                    service_fn(move |req| handle(req, Arc::clone(&clients), peer_ip)),
                 )
                 .await;
         });

@@ -22,6 +22,11 @@ pub struct Site {
 #[serde(deny_unknown_fields)]
 struct SiteToml {
     domain: String,
+
+    /// Empty or omitted = the site is skipped entirely: no certificate is
+    /// requested and SNI handshakes for it are refused. Useful for domains
+    /// whose DNS doesn't point at NekoGuard yet.
+    #[serde(default)]
     upstream: String,
 
     /// Subdomains of `domain`. Each expands to `<name>.<domain>`; a sub
@@ -134,20 +139,24 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
     };
 
     for s in raw.sites {
-        // Parent domain first so `sub` entries inherit its upstream.
-        let parent_upstream = s.upstream;
-        push(s.domain.clone(), parent_upstream.clone());
+        if !s.upstream.is_empty() {
+            push(s.domain.clone(), s.upstream.clone());
+        }
 
         for sub in s.sub {
-            match sub.upstream {
-                Some(u) => push(format!("{}.{}", sub.name, s.domain), u),
-                None => push(format!("{}.{}", sub.name, s.domain), parent_upstream.clone()),
-            }
+            let Some(upstream) = Some(sub.upstream.unwrap_or_else(|| s.upstream.clone()))
+                .filter(|u| !u.is_empty())
+            else {
+                continue; // no upstream here or inherited: skip the whole site
+            };
+            push(format!("{}.{}", sub.name, s.domain), upstream);
         }
     }
 
     if sites.is_empty() {
-        panic!("config '{path}': at least one [[sites]] entry is required");
+        panic!(
+            "config '{path}': no usable sites — every [[sites]] entry needs a non-empty upstream"
+        );
     }
 
     sites.sort_by(|a, b| a.domain.cmp(&b.domain));

@@ -1217,6 +1217,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "minify-html",
+ "native-tls",
  "rand",
  "rust-embed",
  "rustls",
