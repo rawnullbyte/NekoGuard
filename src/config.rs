@@ -73,12 +73,18 @@ pub struct LogConfig {
     #[serde(default)]
     pub file: Option<String>,
 
+    /// Truncate the log file when it exceeds this size in bytes.
+    /// 0 = never truncate. Default: 10MB.
+    #[serde(default = "default_max_size")]
+    pub max_size: u64,
+
     /// Log each HTTP request (method, path, status, upstream, duration).
     #[serde(default = "default_true")]
     pub requests: bool,
 }
 
 fn default_log_level() -> String { "info".to_string() }
+fn default_max_size() -> u64 { 10 * 1024 * 1024 }
 fn default_true() -> bool { true }
 
 #[derive(Debug, Deserialize)]

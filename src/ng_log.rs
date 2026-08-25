@@ -16,12 +16,15 @@ pub fn init(config: &LogConfig) -> Result<(), SetLoggerError> {
         if let Some(parent) = PathBuf::from(path).parent() {
             let _ = fs::create_dir_all(parent);
         }
+        // Start with existing size if file already exists
+        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let f = OpenOptions::new()
             .create(true)
             .append(true)
+            .truncate(false)
             .open(path)
             .unwrap_or_else(|e| panic!("failed to open log file '{path}': {e}"));
-        Mutex::new(f)
+        Mutex::new(LogFile { f, size, max_size: config.max_size, path: PathBuf::from(path) })
     });
 
     let logger = NekoLogger { level, file };
@@ -45,9 +48,16 @@ fn parse_level(s: &str) -> LevelFilter {
     }
 }
 
+struct LogFile {
+    f: std::fs::File,
+    size: u64,
+    max_size: u64,
+    path: PathBuf,
+}
+
 struct NekoLogger {
     level: LevelFilter,
-    file: Option<Mutex<std::fs::File>>,
+    file: Option<Mutex<LogFile>>,
 }
 
 impl Log for NekoLogger {
@@ -74,17 +84,32 @@ impl Log for NekoLogger {
         eprint!("{msg}");
 
         // Write to file if configured
-        if let Some(file) = &self.file {
-            if let Ok(mut f) = file.lock() {
-                let _ = f.write_all(msg.as_bytes());
+        if let Some(log) = &self.file {
+            if let Ok(mut lf) = log.lock() {
+                let msg_bytes = msg.as_bytes();
+                // Truncate when file exceeds max_size (0 = never truncate)
+                if lf.max_size > 0 && lf.size + msg_bytes.len() as u64 > lf.max_size {
+                    // Truncate by reopening — clears content and resets append position
+                    if let Ok(new_f) = OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(&lf.path)
+                    {
+                        lf.f = new_f;
+                        lf.size = 0;
+                    }
+                }
+                let _ = lf.f.write_all(msg_bytes);
+                lf.size += msg_bytes.len() as u64;
             }
         }
     }
 
     fn flush(&self) {
-        if let Some(file) = &self.file {
-            if let Ok(mut f) = file.lock() {
-                let _ = f.flush();
+        if let Some(log) = &self.file {
+            if let Ok(mut lf) = log.lock() {
+                let _ = lf.f.flush();
             }
         }
     }
