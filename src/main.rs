@@ -588,8 +588,19 @@ async fn run_http_redirect() {
 // Server: NekoGuard is the TLS edge. Certificates for the configured domains are
 // obtained and renewed automatically via ACME (Let's Encrypt) using TLS-ALPN-01,
 // and cached on disk so they persist across restarts.
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("nekoguard")
+        .build()
+        .expect("failed to create tokio runtime");
+
+    runtime.block_on(async {
+        main_inner().await;
+    });
+}
+
+async fn main_inner() {
     // Initialize logging before anything else so startup messages are captured.
     let _ = ng_log::init(&CONFIG.log);
 
