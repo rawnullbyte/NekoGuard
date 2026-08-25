@@ -19,7 +19,7 @@ class NginxSim(BaseHTTPRequestHandler):
                     "X-Upstream": UPSTREAM,
                     "X-Real-IP": self.client_address[0],
                     "X-Forwarded-For": self.client_address[0],
-                    "X-Forwarded-Proto": "http",
+                    "X-Forwarded-Proto": "https",
                     "Cookie": self.headers.get("Cookie", ""),
                     "User-Agent": self.headers.get("User-Agent", ""),
                     "Content-Type": self.headers.get("Content-Type", ""),
