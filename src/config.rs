@@ -62,6 +62,35 @@ struct SubSiteToml {
     bypass: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// Minimum log level: error, warn, info, debug. Default: info.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+
+    /// Optional log file path. Omit for stdout-only.
+    #[serde(default)]
+    pub file: Option<String>,
+
+    /// Rotate when file exceeds this size in bytes. Default: 10MB.
+    #[serde(default = "default_max_size")]
+    pub max_size: u64,
+
+    /// Number of rotated files to keep. Default: 5.
+    #[serde(default = "default_max_files")]
+    pub max_files: u32,
+
+    /// Log each HTTP request (method, path, status, upstream, duration).
+    #[serde(default = "default_true")]
+    pub requests: bool,
+}
+
+fn default_log_level() -> String { "info".to_string() }
+fn default_max_size() -> u64 { 10 * 1024 * 1024 }
+fn default_max_files() -> u32 { 5 }
+fn default_true() -> bool { true }
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigToml {
@@ -79,6 +108,10 @@ struct ConfigToml {
     /// Optional plain-HTTP listener for local testing without TLS.
     #[serde(default)]
     port_http: Option<u16>,
+
+    /// Logging configuration.
+    #[serde(default)]
+    log: LogConfig,
 }
 
 /// Runtime config: the on-disk shape with `[[sites.sub]]` entries expanded
@@ -93,6 +126,7 @@ pub struct Config {
     pub staging: bool,
     pub port: u16,
     pub port_http: Option<u16>,
+    pub log: LogConfig,
 }
 
 fn default_cache_dir() -> String {
@@ -210,6 +244,7 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
         staging: raw.staging,
         port: raw.port,
         port_http: raw.port_http,
+        log: raw.log,
     }
 }
 

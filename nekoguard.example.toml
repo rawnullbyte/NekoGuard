@@ -17,6 +17,19 @@ staging = true
 # TLS listen port.
 port = 443
 
+# Logging configuration.
+# level: error, warn, info, debug. Default: info.
+# file: path to a log file. Omit for stdout only.
+# max_size: rotate when file exceeds this size in bytes (default: 10MB).
+# max_files: number of rotated files to keep (default: 5).
+# requests: log each HTTP request with method, path, status, upstream, duration.
+[log]
+level    = "info"
+# file   = "/var/log/nekoguard.log"
+# max_size  = 10485760    # 10MB
+# max_files = 5
+# requests  = true
+
 # One entry per protected site. Each domain gets a Let's Encrypt certificate
 # issued automatically, only accepts TLS handshakes addressed to it, and
 # routes its authenticated traffic to its upstream.

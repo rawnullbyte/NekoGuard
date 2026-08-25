@@ -1,4 +1,5 @@
 mod config;
+mod ng_log;
 mod pow;
 
 use bytes::Bytes;
@@ -293,7 +294,7 @@ async fn proxy_to_upstream(
             Response::from_parts(rp, rb.boxed())
         }
         Err(e) => {
-            eprintln!("Proxy error: {:?}", e);
+            log::error!("Proxy error: {:?}", e);
             text_resp(StatusCode::BAD_GATEWAY, "Upstream error")
         }
     }
@@ -341,7 +342,7 @@ async fn proxy_ws_upgrade(
     {
         Some(a) => a,
         None => {
-            eprintln!("[ws] upstream lookup failed: {upstream_addr}");
+            log::error!("[ws] upstream lookup failed: {upstream_addr}");
             return;
         }
     };
@@ -349,7 +350,7 @@ async fn proxy_ws_upgrade(
     let mut upstream_tcp = match tokio::net::TcpStream::connect(upstream).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[ws] upstream connect failed: {e}");
+            log::error!("[ws] upstream connect failed: {e}");
             return;
         }
     };
@@ -386,7 +387,7 @@ async fn proxy_ws_upgrade(
     rewritten.push_str("\r\n");
 
     if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
-        eprintln!("[ws] upstream write failed: {e}");
+        log::error!("[ws] upstream write failed: {e}");
         return;
     }
 
@@ -406,14 +407,14 @@ async fn proxy_ws_upgrade(
 
     let resp_text = String::from_utf8_lossy(&resp_buf);
     if !resp_text.starts_with("HTTP/1.1 101") {
-        eprintln!("[ws] upstream did not send 101: {}", resp_text.lines().next().unwrap_or(""));
+        log::warn!("[ws] upstream did not send 101: {}", resp_text.lines().next().unwrap_or(""));
         let _ = client_tcp.write_all(resp_buf.as_slice()).await;
         return;
     }
 
     // Forward the101 response to the client.
     if let Err(e) = client_tcp.write_all(&resp_buf).await {
-        eprintln!("[ws] client write101 failed: {e}");
+        log::error!("[ws] client write101 failed: {e}");
         return;
     }
 
@@ -434,6 +435,9 @@ async fn handle(
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    let start = std::time::Instant::now();
+    let host_header = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
+    let _upstream_header = req.headers().get("x-upstream").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
 
     // /__ng/* routes are always handled locally, before any auth or proxy logic.
     if (path == "/__ng/version") && method == Method::GET {
@@ -486,7 +490,11 @@ async fn handle(
 
     if real_ip.map(is_whitelisted).unwrap_or(false) {
         return match upstream {
-            Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
+            Some(u) => {
+                let resp = proxy_to_upstream(&client, req, &u).await;
+                ng_log::request_log(method.as_str(), &path, resp.status().as_u16(), &host_header, &u, start.elapsed().as_millis() as u64);
+                Ok(resp)
+            }
             None => Ok(text_resp(
                 StatusCode::BAD_REQUEST,
                 "No upstream configured for this Host",
@@ -498,10 +506,14 @@ async fn handle(
     // regexes are proxied without the challenge (APIs and machine routes).
     let host = req.headers().get("host").and_then(|v| v.to_str().ok());
     if let Some(site) = host.and_then(|h| CONFIG.site_for_host(h)) {
-        let path = req.uri().path();
-        if site.bypass.iter().any(|re| re.is_match(path)) {
+        let req_path = req.uri().path().to_string();
+        if site.bypass.iter().any(|re| re.is_match(&req_path)) {
             return match upstream {
-                Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
+                Some(u) => {
+                    let resp = proxy_to_upstream(&client, req, &u).await;
+                    ng_log::request_log(method.as_str(), &req_path, resp.status().as_u16(), &host_header, &u, start.elapsed().as_millis() as u64);
+                    Ok(resp)
+                }
                 None => Ok(text_resp(
                     StatusCode::BAD_REQUEST,
                     "No upstream configured for this Host",
@@ -510,7 +522,9 @@ async fn handle(
         }
     }
 
-    Ok(challenge_page(&pow::new_challenge(CHALLENGE_TTL)))
+    let resp = challenge_page(&pow::new_challenge(CHALLENGE_TTL));
+    ng_log::request_log(method.as_str(), &path, 200, &host_header, "challenge", start.elapsed().as_millis() as u64);
+    Ok(resp)
 }
 
 // Redirect all plaintext :80 traffic to https so ACME http clients and stray
@@ -550,7 +564,7 @@ async fn run_http_redirect() {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("warning: could not bind :80 for http->https redirect: {e}");
+            log::warn!("could not bind :80 for http->https redirect: {e}");
             return;
         }
     };
@@ -558,7 +572,7 @@ async fn run_http_redirect() {
         let (tcp, _) = match listener.accept().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("accept(:80): {e}");
+                log::error!("accept(:80): {e}");
                 continue;
             }
         };
@@ -576,6 +590,9 @@ async fn run_http_redirect() {
 // and cached on disk so they persist across restarts.
 #[tokio::main]
 async fn main() {
+    // Initialize logging before anything else so startup messages are captured.
+    let _ = ng_log::init(&CONFIG.log);
+
     // rustls needs a process-wide crypto provider installed before any TLS use.
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -612,14 +629,14 @@ async fn main() {
     if let Some(http_port) = CONFIG.port_http {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
         if let Ok(http_listener) = TcpListener::bind(addr).await {
-            println!("NekoGuard [:{http_port}] HTTP test listener");
+            log::info!("HTTP test listener on :{http_port}");
             let client = Arc::clone(&client);
             tokio::spawn(async move {
                 loop {
                     let (tcp, peer) = match http_listener.accept().await {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("accept(http): {e}");
+                            log::error!("accept(http): {e}");
                             continue;
                         }
                     };
@@ -646,10 +663,11 @@ async fn main() {
                                 .map(|s| s.upstream.clone());
                             match upstream {
                                 Some(u) => {
+                                    ng_log::ws_log(&host, &u, "/ws");
                                     proxy_ws_upgrade(tcp, &u).await;
                                 }
                                 None => {
-                                    eprintln!("[ws] no upstream for host {host}");
+                                    log::warn!("[ws] no upstream for host {host}");
                                 }
                             }
                             return;
@@ -667,7 +685,7 @@ async fn main() {
                 }
             });
         } else {
-            eprintln!("warning: could not bind HTTP test port {http_port}");
+            log::warn!("could not bind HTTP test port {http_port}");
         }
     }
 
@@ -693,15 +711,15 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             match acme_state.next().await {
-                Some(Ok(ok)) => println!("acme: {ok:?}"),
-                Some(Err(err)) => eprintln!("acme error: {err:?}"),
+                Some(Ok(ok)) => log::info!("acme: {ok:?}"),
+                Some(Err(err)) => log::error!("acme error: {err:?}"),
                 None => break,
             }
         }
     });
 
-    println!(
-        "NekoGuard [:{port}] TLS edge — {} site(s), {} permanent IP(s){}",
+    log::info!(
+        "NekoGuard :{port} TLS edge — {} site(s), {} permanent IP(s){}",
         CONFIG.sites.len(),
         PERM.len(),
         if CONFIG.staging { " [staging]" } else { "" }
@@ -711,7 +729,7 @@ async fn main() {
         let (tcp, peer) = match listener.accept().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("accept: {e}");
+                log::error!("accept: {e}");
                 continue;
             }
         };
@@ -725,7 +743,7 @@ async fn main() {
             let start_handshake = match LazyConfigAcceptor::new(Default::default(), tcp).await {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("tls accept: {e}");
+                    log::error!("tls accept: {e}");
                     return;
                 }
             };
@@ -745,17 +763,17 @@ async fn main() {
             match start_handshake.client_hello().server_name() {
                 Some(name) if CONFIG.is_known_domain(name) => {}
                 _ => {
-                    eprintln!(
+                    log::warn!(
                         "tls: refused handshake for unknown/absent SNI from {peer_ip}"
                     );
                     return;
                 }
             }
 
-            let mut tls = match start_handshake.into_stream(default_rustls_config).await {
+            let tls = match start_handshake.into_stream(default_rustls_config).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("tls handshake: {e}");
+                    log::error!("tls handshake: {e}");
                     return;
                 }
             };
@@ -782,7 +800,7 @@ async fn main() {
                 .contains("upgrade: websocket");
             // Recover the TLS stream from BufReader — remaining bytes
             // (pipelined requests) are still inside and hyper will read them.
-            let mut tls = buf_reader.into_inner();
+            let tls = buf_reader.into_inner();
 
             if is_ws {
                 // Resolve the upstream from the Host header in the request.
@@ -805,14 +823,14 @@ async fn main() {
                             .and_then(|mut a| a.next()) {
                             Some(a) => a,
                             None => {
-                                eprintln!("[ws] upstream lookup failed: {upstream}");
+                                log::error!("[ws] upstream lookup failed: {upstream}");
                                 return;
                             }
                         };
                     let mut upstream_tcp = match tokio::net::TcpStream::connect(upstream_sock).await {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[ws] upstream connect failed: {e}");
+                            log::error!("[ws] upstream connect failed: {e}");
                             return;
                         }
                     };
@@ -850,7 +868,7 @@ async fn main() {
 
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
-                        eprintln!("[ws-tls] upstream write failed: {e}");
+                        log::error!("[ws-tls] upstream write failed: {e}");
                         return;
                     }
 
@@ -875,9 +893,9 @@ async fn main() {
                     let c2u = tokio::io::copy(&mut client_read, &mut uw);
                     let u2c = tokio::io::copy(&mut ur, &mut client_write);
                     let _ = tokio::join!(c2u, u2c);
-                    eprintln!("[ws-tls] bidirectional copy ended");
+                    log::debug!("[ws-tls] bidirectional copy ended");
                 } else {
-                    eprintln!("[ws] no upstream for host {host}");
+                    log::warn!("[ws] no upstream for host {host}");
                 }
                 return;
             }

@@ -63,6 +63,24 @@ Bypassed requests skip PoW entirely and are exposed to bots — anchor patterns 
 
 Certificates are requested only for names in `domains`, cached in `cache_dir`, and renewed automatically before expiry. Set `staging = false` once your setup works; Let's Encrypt rate-limits production issuance.
 
+### Logging
+
+NekoGuard uses a configurable logging system with optional file output and size-based rotation:
+
+```toml
+[log]
+level     = "info"          # error, warn, info, debug
+file      = "/var/log/nekoguard.log"  # omit = stdout only
+max_size  = 10485760        # rotate at 10MB (default)
+max_files = 5               # keep 5 rotated files (default)
+requests  = true            # log each request: method, path, status, upstream, duration
+```
+
+When `requests = true`, each proxied request is logged with timing:
+```
+[2026-08-26 14:30:01] [INFO ] GET /api/ping → 200 (immich.nullbyte.rip → http://10.1.3.50:2283) 2ms
+```
+
 ### Environment Variables
 
 - `NG_CONFIG`: Path to the TOML config file (default `nekoguard.toml`).
