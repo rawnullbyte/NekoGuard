@@ -373,6 +373,7 @@ async fn proxy_ws_upgrade(
             || lower.starts_with("upgrade:")
             || lower.starts_with("sec-websocket")
             || lower.starts_with("origin:")
+            || lower.starts_with("cookie:")
         {
             rewritten.push_str(&format!("{line}\r\n"));
         }
@@ -827,6 +828,7 @@ async fn main() {
                             || lower.starts_with("upgrade:")
                             || lower.starts_with("sec-websocket")
                             || lower.starts_with("origin:")
+                            || lower.starts_with("cookie:")
                         {
                             rewritten.push_str(&format!("{line}\r\n"));
                         }
@@ -838,34 +840,51 @@ async fn main() {
                     rewritten.push_str("\r\n");
 
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    if upstream_tcp.write_all(rewritten.as_bytes()).await.is_err() { return; }
+                    if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
+                        eprintln!("[ws-tls] upstream write failed: {e}");
+                        return;
+                    }
 
-                    // Read101 from upstream — use PrefixedReader to replay
-                    // the already-consumed prefix bytes.
-                    let mut prefixed = PrefixedReader {
-                        prefix: std::io::Cursor::new(prefix),
-                        inner: tls,
-                    };
+                    // Read101 from upstream (NOT from the TLS client stream).
                     let mut resp_buf = Vec::with_capacity(1024);
                     let mut tmp = [0u8; 1024];
                     loop {
-                        match prefixed.read(&mut tmp).await {
-                            Ok(0) | Err(_) => return,
+                        match upstream_tcp.read(&mut tmp).await {
+                            Ok(0) => {
+                                eprintln!("[ws-tls] upstream EOF before101");
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!("[ws-tls] upstream read failed: {e}");
+                                return;
+                            }
                             Ok(n) => resp_buf.extend_from_slice(&tmp[..n]),
                         }
                         if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
                     }
-                    if !resp_buf.starts_with(b"HTTP/1.1 101") { return; }
+                    let resp_preview = String::from_utf8_lossy(&resp_buf);
+                    eprintln!("[ws-tls] upstream response: {}", resp_preview.lines().next().unwrap_or("?"));
+                    if !resp_buf.starts_with(b"HTTP/1.1 101") {
+                        eprintln!("[ws-tls] upstream did not send 101");
+                        return;
+                    }
 
-                    // Forward the101 to the client and split for raw copy.
-                    let (mut client_read, mut client_write) = tokio::io::split(prefixed.into_inner());
-                    let _ = client_write.write_all(&resp_buf).await;
+                    // Split the TLS stream for bidirectional copy. The client
+                    // already received its own request bytes; it's waiting for
+                    // the101 response, not a replay of its request.
+                    let (mut client_read, mut client_write) = tokio::io::split(tls);
+                    if let Err(e) = client_write.write_all(&resp_buf).await {
+                        eprintln!("[ws-tls] client write101 failed: {e}");
+                        return;
+                    }
+                    eprintln!("[ws-tls]101 forwarded, starting bidirectional copy");
 
                     // Bidirectional copy.
                     let (mut ur, mut uw) = upstream_tcp.into_split();
                     let c2u = tokio::io::copy(&mut client_read, &mut uw);
                     let u2c = tokio::io::copy(&mut ur, &mut client_write);
                     let _ = tokio::join!(c2u, u2c);
+                    eprintln!("[ws-tls] bidirectional copy ended");
                 } else {
                     eprintln!("[ws] no upstream for host {host}");
                 }
