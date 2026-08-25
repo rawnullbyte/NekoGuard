@@ -631,13 +631,13 @@ async fn main() {
                         // before hyper consumes them.
                         let mut peek_buf = [0u8; 4096];
                         let peek_len = tcp.peek(&mut peek_buf).await.unwrap_or(0);
-                        let raw = String::from_utf8_lossy(&peek_buf[..peek_len]);
-                        let lower = raw.to_ascii_lowercase();
+                        let lower = String::from_utf8_lossy(&peek_buf[..peek_len]).to_ascii_lowercase();
                         let is_ws = lower.contains("upgrade: websocket");
 
                         if is_ws {
                             // Extract Host header to resolve the upstream.
-                            let host = raw.lines()
+                            let host = String::from_utf8_lossy(&peek_buf[..peek_len])
+                                .lines()
                                 .find(|l| l.to_ascii_lowercase().starts_with("host:"))
                                 .and_then(|l| l.split_once(':').map(|x| x.1))
                                 .map(|v| v.trim().to_string())
@@ -760,24 +760,34 @@ async fn main() {
                 }
             };
 
-            // Read the first bytes to detect WebSocket upgrade. After a TLS
-            // handshake the HTTP request sits in the kernel buffer — peek at it
-            // before hyper consumes it.
-            let mut prefix = vec![0u8; 4096];
-            let n = match tls.read(&mut prefix).await {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("[tls-ws] read failed: {e}");
-                    return;
+            // Read exactly one HTTP request's headers to detect WebSocket
+            // upgrade. We must NOT read beyond \r\n\r\n — the TLS stream
+            // may contain pipelined requests that hyper needs to see.
+            let mut buf_reader = tokio::io::BufReader::new(tls);
+            let mut header_bytes = Vec::new();
+            let mut one_byte = [0u8; 1];
+            loop {
+                match buf_reader.read(&mut one_byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        header_bytes.push(one_byte[0]);
+                        if header_bytes.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
                 }
-            };
-            prefix.truncate(n);
-            let raw = String::from_utf8_lossy(&prefix);
-            let is_ws = raw.to_ascii_lowercase().contains("upgrade: websocket");
+            }
+            let is_ws = String::from_utf8_lossy(&header_bytes)
+                .to_ascii_lowercase()
+                .contains("upgrade: websocket");
+            // Recover the TLS stream from BufReader — remaining bytes
+            // (pipelined requests) are still inside and hyper will read them.
+            let mut tls = buf_reader.into_inner();
 
             if is_ws {
                 // Resolve the upstream from the Host header in the request.
-                let host = raw.lines()
+                let host = String::from_utf8_lossy(&header_bytes)
+                    .lines()
                     .find(|l| l.to_ascii_lowercase().starts_with("host:"))
                     .and_then(|l| l.split_once(':').map(|x| x.1))
                     .map(|v| v.trim().to_string())
@@ -809,12 +819,13 @@ async fn main() {
                     upstream_tcp.set_nodelay(true).ok();
 
                     // Rewrite request line + selective headers.
-                    let first_line = raw.lines().next().unwrap_or("");
+                    let hdr_text = String::from_utf8_lossy(&header_bytes);
+                    let first_line = hdr_text.lines().next().unwrap_or("");
                     let fl_parts: Vec<&str> = first_line.split_whitespace().collect();
                     let ws_path = if fl_parts.len() >= 2 { fl_parts[1] } else { "/" };
                     let mut rewritten = format!("{} {} HTTP/1.1\r\n", fl_parts[0], ws_path);
                     let mut saw_host = false;
-                    for line in raw[raw.find("\r\n").unwrap_or(0) + 2..]
+                    for line in hdr_text[hdr_text.find("\r\n").unwrap_or(0) + 2..]
                         .lines().take_while(|l| !l.is_empty())
                     {
                         let lower = line.to_ascii_lowercase();
@@ -874,7 +885,7 @@ async fn main() {
             // Non-upgrade: replay the already-read bytes through a prefixed
             // wrapper so hyper sees the full request.
             let prefixed = PrefixedReader {
-                prefix: std::io::Cursor::new(prefix),
+                prefix: std::io::Cursor::new(header_bytes),
                 inner: tls,
             };
             let io = TokioIo::new(prefixed);
