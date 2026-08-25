@@ -69,12 +69,6 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedReader<
     }
 }
 
-impl<W> PrefixedReader<W> {
-    fn into_inner(self) -> W {
-        self.inner
-    }
-}
-
 const CHALLENGE_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/challenge.min.html"));
 const MAX_VERIFY_BODY: usize = 512;
 const CHALLENGE_TTL: Duration = Duration::from_secs(300); // 5 min

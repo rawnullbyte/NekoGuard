@@ -80,6 +80,7 @@ pub struct LogConfig {
 
     /// Log each HTTP request (method, path, status, upstream, duration).
     #[serde(default = "default_true")]
+    #[allow(dead_code)]
     pub requests: bool,
 }
 
