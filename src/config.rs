@@ -73,22 +73,12 @@ pub struct LogConfig {
     #[serde(default)]
     pub file: Option<String>,
 
-    /// Rotate when file exceeds this size in bytes. Default: 10MB.
-    #[serde(default = "default_max_size")]
-    pub max_size: u64,
-
-    /// Number of rotated files to keep. Default: 5.
-    #[serde(default = "default_max_files")]
-    pub max_files: u32,
-
     /// Log each HTTP request (method, path, status, upstream, duration).
     #[serde(default = "default_true")]
     pub requests: bool,
 }
 
 fn default_log_level() -> String { "info".to_string() }
-fn default_max_size() -> u64 { 10 * 1024 * 1024 }
-fn default_max_files() -> u32 { 5 }
 fn default_true() -> bool { true }
 
 #[derive(Debug, Deserialize)]

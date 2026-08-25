@@ -65,14 +65,12 @@ Certificates are requested only for names in `domains`, cached in `cache_dir`, a
 
 ### Logging
 
-NekoGuard uses a configurable logging system with optional file output and size-based rotation:
+NekoGuard uses a configurable logging system with optional file output:
 
 ```toml
 [log]
 level     = "info"          # error, warn, info, debug
 file      = "/var/log/nekoguard.log"  # omit = stdout only
-max_size  = 10485760        # rotate at 10MB (default)
-max_files = 5               # keep 5 rotated files (default)
 requests  = true            # log each request: method, path, status, upstream, duration
 ```
 

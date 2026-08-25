@@ -1,5 +1,5 @@
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -11,20 +11,20 @@ use crate::config::LogConfig;
 pub fn init(config: &LogConfig) -> Result<(), SetLoggerError> {
     let level = parse_level(&config.level);
 
-    let rotating = config.file.as_ref().map(|path| {
-        let r = RotatingFile::new(
-            PathBuf::from(path),
-            config.max_size,
-            config.max_files,
-        );
-        r
+    let file = config.file.as_ref().map(|path| {
+        // Ensure parent directory exists
+        if let Some(parent) = PathBuf::from(path).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("failed to open log file '{path}': {e}"));
+        Mutex::new(f)
     });
 
-    let logger = NekoLogger {
-        level,
-        file: rotating.map(|r| Mutex::new(r)),
-        requests: config.requests,
-    };
+    let logger = NekoLogger { level, file };
 
     log::set_logger(Box::leak(Box::new(logger)))?;
     log::set_max_level(level);
@@ -47,8 +47,7 @@ fn parse_level(s: &str) -> LevelFilter {
 
 struct NekoLogger {
     level: LevelFilter,
-    file: Option<Mutex<RotatingFile>>,
-    requests: bool,
+    file: Option<Mutex<std::fs::File>>,
 }
 
 impl Log for NekoLogger {
@@ -77,7 +76,7 @@ impl Log for NekoLogger {
         // Write to file if configured
         if let Some(file) = &self.file {
             if let Ok(mut f) = file.lock() {
-                f.write_all(msg.as_bytes());
+                let _ = f.write_all(msg.as_bytes());
             }
         }
     }
@@ -85,7 +84,7 @@ impl Log for NekoLogger {
     fn flush(&self) {
         if let Some(file) = &self.file {
             if let Ok(mut f) = file.lock() {
-                f.flush();
+                let _ = f.flush();
             }
         }
     }
@@ -99,9 +98,6 @@ pub fn request_log(
     upstream: &str,
     elapsed_ms: u64,
 ) {
-    if !log::log_enabled!(Level::Info) {
-        return;
-    }
     log::info!(
         "{} {} → {} ({} → {}) {}ms",
         method,
@@ -127,14 +123,11 @@ fn timestamp() -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
-
-    // Approximate Y-M-D from epoch days (good enough for log timestamps)
     let (y, mo, d) = epoch_days_to_ymd(days);
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
 }
 
 fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Simple civil calendar from epoch days
     let mut y = 1970u64;
     let mut remaining = days;
     loop {
@@ -164,97 +157,4 @@ fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-// ── Rotating file writer ─────────────────────────────────────────
-
-struct RotatingFile {
-    path: PathBuf,
-    file: Option<File>,
-    size: u64,
-    max_size: u64,
-    max_files: u32,
-}
-
-impl RotatingFile {
-    fn new(path: PathBuf, max_size: u64, max_files: u32) -> Self {
-        let mut rf = RotatingFile {
-            path,
-            file: None,
-            size: 0,
-            max_size,
-            max_files,
-        };
-        rf.open();
-        rf
-    }
-
-    fn open(&mut self) {
-        // Check existing file size
-        self.size = fs::metadata(&self.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .ok();
-    }
-
-    fn write_all(&mut self, buf: &[u8]) {
-        if self.size + buf.len() as u64 > self.max_size && self.size > 0 {
-            self.rotate();
-        }
-
-        if let Some(f) = &mut self.file {
-            let _ = f.write_all(buf);
-            self.size += buf.len() as u64;
-        }
-    }
-
-    fn flush(&mut self) {
-        if let Some(f) = &mut self.file {
-            let _ = f.flush();
-        }
-    }
-
-    fn rotate(&mut self) {
-        // Close current file
-        self.file = None;
-
-        // Shift .N → .N+1 (delete oldest beyond max_files)
-        for i in (1..=self.max_files).rev() {
-            let from = self.path_with_suffix(i);
-            let to = self.path_with_suffix(i + 1);
-            if from.exists() {
-                if i == self.max_files {
-                    let _ = fs::remove_file(&from);
-                } else {
-                    let _ = fs::rename(&from, &to);
-                }
-            }
-        }
-
-        // Rename current → .1
-        let first = self.path_with_suffix(1);
-        if self.path.exists() {
-            let _ = fs::rename(&self.path, &first);
-        }
-
-        // Open fresh file
-        self.size = 0;
-        self.open();
-    }
-
-    fn path_with_suffix(&self, n: u32) -> PathBuf {
-        let p = self.path.to_string_lossy().to_string();
-        PathBuf::from(format!("{p}.{n}"))
-    }
-}
-
-impl Drop for RotatingFile {
-    fn drop(&mut self) {
-        self.flush();
-    }
 }
