@@ -75,6 +75,10 @@ struct ConfigToml {
     staging: bool,
     #[serde(default = "default_port")]
     port: u16,
+
+    /// Optional plain-HTTP listener for local testing without TLS.
+    #[serde(default)]
+    port_http: Option<u16>,
 }
 
 /// Runtime config: the on-disk shape with `[[sites.sub]]` entries expanded
@@ -88,6 +92,7 @@ pub struct Config {
     pub cache_dir: String,
     pub staging: bool,
     pub port: u16,
+    pub port_http: Option<u16>,
 }
 
 fn default_cache_dir() -> String {
@@ -204,6 +209,7 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
         cache_dir: raw.cache_dir,
         staging: raw.staging,
         port: raw.port,
+        port_http: raw.port_http,
     }
 }
 

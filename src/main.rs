@@ -22,9 +22,57 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::LazyConfigAcceptor;
+
+/// Wraps a reader with a pre-filled prefix consumed first, then delegates
+/// to the inner reader. Replays bytes already read during TLS peeking.
+struct PrefixedReader<W> {
+    prefix: std::io::Cursor<Vec<u8>>,
+    inner: W,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
+            return std::pin::Pin::new(&mut self.prefix).poll_read(cx, buf);
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedReader<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<W> PrefixedReader<W> {
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
 
 const CHALLENGE_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/challenge.min.html"));
 const MAX_VERIFY_BODY: usize = 512;
@@ -213,6 +261,15 @@ async fn proxy_to_upstream(
         Ok(resp) => {
             let (mut rp, rb) = resp.into_parts();
 
+            // WebSocket upgrade: forward the101 as-is. Hyper's body abstraction
+            // doesn't pipe raw TCP bytes after an upgrade, so we return the
+            // body directly and let the with_upgrades() connection handle it.
+            if rp.status == StatusCode::SWITCHING_PROTOCOLS {
+                rp.headers.remove("transfer-encoding");
+                rp.headers.remove("content-length");
+                return Response::from_parts(rp, rb.boxed());
+            }
+
             rp.headers.remove("content-security-policy");
             rp.headers.remove("content-security-policy-report-only");
             rp.headers.remove("transfer-encoding");
@@ -240,6 +297,132 @@ async fn proxy_to_upstream(
             text_resp(StatusCode::BAD_GATEWAY, "Upstream error")
         }
     }
+}
+
+// ── WebSocket upgrade proxy ──────────────────────────────────────────
+// After a101 Switching Protocols, the connection is raw TCP.  Hyper's body
+// abstraction cannot pipe these bytes — it finishes immediately — so we
+// bypass it entirely: read the request ourselves, forward to the upstream,
+// read back the101, send it to the client, then copy raw bytes both ways.
+async fn proxy_ws_upgrade(
+    mut client_tcp: tokio::net::TcpStream,
+    upstream_addr: &str,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Read the raw HTTP request from the client.
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = match client_tcp.read(&mut tmp).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let req_text = String::from_utf8_lossy(&buf);
+    let first_line = req_text.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let path = if parts.len() >= 2 { parts[1] } else { "/" };
+
+    // Forward to upstream over TCP. Strip the scheme prefix if present.
+    let upstream_host = upstream_addr
+        .strip_prefix("http://")
+        .or_else(|| upstream_addr.strip_prefix("https://"))
+        .unwrap_or(upstream_addr);
+    let upstream: std::net::SocketAddr = match tokio::net::lookup_host(upstream_host)
+        .await
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+    {
+        Some(a) => a,
+        None => {
+            eprintln!("[ws] upstream lookup failed: {upstream_addr}");
+            return;
+        }
+    };
+
+    let mut upstream_tcp = match tokio::net::TcpStream::connect(upstream).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[ws] upstream connect failed: {e}");
+            return;
+        }
+    };
+    upstream_tcp.set_nodelay(true).ok();
+
+    // Rewrite the request line to use the upstream's path only, and add
+    // forwarded headers.
+    let mut rewritten = format!("{} {} HTTP/1.1\r\n", parts[0], path);
+    let mut saw_host = false;
+    for line in req_text[req_text.find("\r\n").unwrap_or(0) + 2..]
+        .lines()
+        .take_while(|l| !l.is_empty())
+    {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("host:") {
+            // Rewrite to upstream authority
+            let authority = upstream_addr.split(':').next().unwrap_or(upstream_addr);
+            rewritten.push_str(&format!("Host: {authority}\r\n"));
+            saw_host = true;
+        } else if lower.starts_with("connection:")
+            || lower.starts_with("upgrade:")
+            || lower.starts_with("sec-websocket")
+            || lower.starts_with("origin:")
+        {
+            rewritten.push_str(&format!("{line}\r\n"));
+        }
+        // Skip all other headers (cookie, user-agent, etc. — not needed for WS)
+    }
+    if !saw_host {
+        let authority = upstream_addr.split(':').next().unwrap_or(upstream_addr);
+        rewritten.push_str(&format!("Host: {authority}\r\n"));
+    }
+    rewritten.push_str("\r\n");
+
+    if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
+        eprintln!("[ws] upstream write failed: {e}");
+        return;
+    }
+
+    // Read the101 response from upstream.
+    let mut resp_buf = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = match upstream_tcp.read(&mut tmp).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        resp_buf.extend_from_slice(&tmp[..n]);
+        if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let resp_text = String::from_utf8_lossy(&resp_buf);
+    if !resp_text.starts_with("HTTP/1.1 101") {
+        eprintln!("[ws] upstream did not send 101: {}", resp_text.lines().next().unwrap_or(""));
+        let _ = client_tcp.write_all(resp_buf.as_slice()).await;
+        return;
+    }
+
+    // Forward the101 response to the client.
+    if let Err(e) = client_tcp.write_all(&resp_buf).await {
+        eprintln!("[ws] client write101 failed: {e}");
+        return;
+    }
+
+    // Bidirectional raw byte copy.
+    let (mut upstream_read, mut upstream_write) = upstream_tcp.into_split();
+    let (mut client_read, mut client_write) = client_tcp.into_split();
+
+    let c2u = tokio::io::copy(&mut client_read, &mut upstream_write);
+    let u2c = tokio::io::copy(&mut upstream_read, &mut client_write);
+    let _ = tokio::join!(c2u, u2c);
 }
 
 // Main handler
@@ -279,19 +462,6 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .and_then(|h| CONFIG.site_for_host(h))
         .map(|s| s.upstream.clone());
-
-    // HTTP upgrade (WebSockets): always proxy through to the upstream.
-    // The backend handles its own auth for WS connections.
-    let is_upgrade = req
-        .headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-
-    if is_upgrade && upstream.is_some() {
-        return Ok(proxy_to_upstream(&client, req, &upstream.unwrap()).await);
-    }
 
     if path == "/__ng/verify" && method == Method::POST {
         let bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
@@ -437,6 +607,69 @@ async fn main() {
 
     tokio::spawn(run_http_redirect());
 
+    // Optional plain-HTTP listener for local testing without TLS.
+    if let Some(http_port) = CONFIG.port_http {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
+        if let Ok(http_listener) = TcpListener::bind(addr).await {
+            println!("NekoGuard [:{http_port}] HTTP test listener");
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, peer) = match http_listener.accept().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("accept(http): {e}");
+                            continue;
+                        }
+                    };
+                    tcp.set_nodelay(true).ok();
+                    let peer_ip = peer.ip();
+                    let client = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        // Peek at the raw bytes to detect WebSocket upgrade
+                        // before hyper consumes them.
+                        let mut peek_buf = [0u8; 4096];
+                        let peek_len = tcp.peek(&mut peek_buf).await.unwrap_or(0);
+                        let raw = String::from_utf8_lossy(&peek_buf[..peek_len]);
+                        let lower = raw.to_ascii_lowercase();
+                        let is_ws = lower.contains("upgrade: websocket");
+
+                        if is_ws {
+                            // Extract Host header to resolve the upstream.
+                            let host = raw.lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                                .and_then(|l| l.split_once(':').map(|x| x.1))
+                                .map(|v| v.trim().to_string())
+                                .unwrap_or_default();
+                            let upstream = CONFIG.site_for_host(&host)
+                                .map(|s| s.upstream.clone());
+                            match upstream {
+                                Some(u) => {
+                                    proxy_ws_upgrade(tcp, &u).await;
+                                }
+                                None => {
+                                    eprintln!("[ws] no upstream for host {host}");
+                                }
+                            }
+                            return;
+                        }
+
+                        let io = TokioIo::new(tcp);
+                        let conn = http1::Builder::new().serve_connection(
+                            io,
+                            service_fn(move |req| {
+                                handle(req, Arc::clone(&client), peer_ip)
+                            }),
+                        );
+                        let _ = conn.with_upgrades().await;
+                    });
+                }
+            });
+        } else {
+            eprintln!("warning: could not bind HTTP test port {http_port}");
+        }
+    }
+
     let port = CONFIG.port;
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await.unwrap();
@@ -518,7 +751,7 @@ async fn main() {
                 }
             }
 
-            let tls = match start_handshake.into_stream(default_rustls_config).await {
+            let mut tls = match start_handshake.into_stream(default_rustls_config).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("tls handshake: {e}");
@@ -526,7 +759,118 @@ async fn main() {
                 }
             };
 
-            let io = TokioIo::new(tls);
+            // Read the first bytes to detect WebSocket upgrade. After a TLS
+            // handshake the HTTP request sits in the kernel buffer — peek at it
+            // before hyper consumes it.
+            let mut prefix = vec![0u8; 4096];
+            let n = tls.read(&mut prefix).await.unwrap_or(0);
+            prefix.truncate(n);
+            let raw = String::from_utf8_lossy(&prefix);
+            let is_ws = raw.to_ascii_lowercase().contains("upgrade: websocket");
+
+            if is_ws {
+                // Resolve the upstream from the Host header in the request.
+                let host = raw.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                    .and_then(|l| l.split_once(':').map(|x| x.1))
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default();
+                if let Some(site) = CONFIG.site_for_host(&host) {
+                    let upstream = site.upstream.clone();
+
+                    // Forward the WS upgrade to upstream over TCP.
+                    let upstream_host = upstream
+                        .strip_prefix("http://")
+                        .or_else(|| upstream.strip_prefix("https://"))
+                        .unwrap_or(&upstream);
+                    let upstream_sock: std::net::SocketAddr =
+                        match tokio::net::lookup_host(upstream_host).await.ok()
+                            .and_then(|mut a| a.next()) {
+                            Some(a) => a,
+                            None => {
+                                eprintln!("[ws] upstream lookup failed: {upstream}");
+                                return;
+                            }
+                        };
+                    let mut upstream_tcp = match tokio::net::TcpStream::connect(upstream_sock).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[ws] upstream connect failed: {e}");
+                            return;
+                        }
+                    };
+                    upstream_tcp.set_nodelay(true).ok();
+
+                    // Rewrite request line + selective headers.
+                    let first_line = raw.lines().next().unwrap_or("");
+                    let fl_parts: Vec<&str> = first_line.split_whitespace().collect();
+                    let ws_path = if fl_parts.len() >= 2 { fl_parts[1] } else { "/" };
+                    let mut rewritten = format!("{} {} HTTP/1.1\r\n", fl_parts[0], ws_path);
+                    let mut saw_host = false;
+                    for line in raw[raw.find("\r\n").unwrap_or(0) + 2..]
+                        .lines().take_while(|l| !l.is_empty())
+                    {
+                        let lower = line.to_ascii_lowercase();
+                        if lower.starts_with("host:") {
+                            let auth = upstream.split(':').next().unwrap_or(&upstream);
+                            rewritten.push_str(&format!("Host: {auth}\r\n"));
+                            saw_host = true;
+                        } else if lower.starts_with("connection:")
+                            || lower.starts_with("upgrade:")
+                            || lower.starts_with("sec-websocket")
+                            || lower.starts_with("origin:")
+                        {
+                            rewritten.push_str(&format!("{line}\r\n"));
+                        }
+                    }
+                    if !saw_host {
+                        let auth = upstream.split(':').next().unwrap_or(&upstream);
+                        rewritten.push_str(&format!("Host: {auth}\r\n"));
+                    }
+                    rewritten.push_str("\r\n");
+
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    if upstream_tcp.write_all(rewritten.as_bytes()).await.is_err() { return; }
+
+                    // Read101 from upstream — use PrefixedReader to replay
+                    // the already-consumed prefix bytes.
+                    let mut prefixed = PrefixedReader {
+                        prefix: std::io::Cursor::new(prefix),
+                        inner: tls,
+                    };
+                    let mut resp_buf = Vec::with_capacity(1024);
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match prefixed.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => resp_buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    }
+                    if !resp_buf.starts_with(b"HTTP/1.1 101") { return; }
+
+                    // Forward the101 to the client and split for raw copy.
+                    let (mut client_read, mut client_write) = tokio::io::split(prefixed.into_inner());
+                    let _ = client_write.write_all(&resp_buf).await;
+
+                    // Bidirectional copy.
+                    let (mut ur, mut uw) = upstream_tcp.into_split();
+                    let c2u = tokio::io::copy(&mut client_read, &mut uw);
+                    let u2c = tokio::io::copy(&mut ur, &mut client_write);
+                    let _ = tokio::join!(c2u, u2c);
+                } else {
+                    eprintln!("[ws] no upstream for host {host}");
+                }
+                return;
+            }
+
+            // Non-upgrade: replay the already-read bytes through a prefixed
+            // wrapper so hyper sees the full request.
+            let prefixed = PrefixedReader {
+                prefix: std::io::Cursor::new(prefix),
+                inner: tls,
+            };
+            let io = TokioIo::new(prefixed);
             let conn = http1::Builder::new().serve_connection(
                 io,
                 service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
