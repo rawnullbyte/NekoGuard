@@ -615,8 +615,8 @@ async fn main_inner() {
     let mut http_connector = HttpConnector::new();
     http_connector.enforce_http(false);
     let client: ProxyClient = Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(16)
+        .pool_idle_timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(64)
         .http1_title_case_headers(true)
         .build(HttpsConnector::from((http_connector, trust_tls.into())));
     let client = Arc::new(client);
