@@ -763,10 +763,18 @@ async fn main() {
             // handshake the HTTP request sits in the kernel buffer — peek at it
             // before hyper consumes it.
             let mut prefix = vec![0u8; 4096];
-            let n = tls.read(&mut prefix).await.unwrap_or(0);
+            let n = match tls.read(&mut prefix).await {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("[tls-ws] read failed: {e}");
+                    return;
+                }
+            };
             prefix.truncate(n);
             let raw = String::from_utf8_lossy(&prefix);
+            eprintln!("[tls-ws] read {n} bytes, first 120: {:?}", &raw[..raw.len().min(120)]);
             let is_ws = raw.to_ascii_lowercase().contains("upgrade: websocket");
+            eprintln!("[tls-ws] is_ws={is_ws}");
 
             if is_ws {
                 // Resolve the upstream from the Host header in the request.
