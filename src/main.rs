@@ -277,6 +277,23 @@ async fn handle(
         .and_then(|h| CONFIG.site_for_host(h))
         .map(|s| s.upstream.clone());
 
+    // HTTP upgrade (WebSockets): proxy the upgrade request to upstream and
+    // let hyper's upgrade mechanism handle the bidirectional stream.
+    // Requires an existing session — unauthenticated WS upgrades are blocked.
+    let is_upgrade = req
+        .headers()
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if is_upgrade && real_ip.map(is_allowed).unwrap_or(false) {
+        return match upstream {
+            Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
+            None => Ok(text_resp(StatusCode::BAD_REQUEST, "No upstream configured")),
+        };
+    }
+
     if path == "/__ng/verify" && method == Method::POST {
         let bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
             Ok(b) => b.to_bytes(),
@@ -511,12 +528,11 @@ async fn main() {
             };
 
             let io = TokioIo::new(tls);
-            let _ = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
-                )
-                .await;
+            let conn = http1::Builder::new().serve_connection(
+                io,
+                service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
+            );
+            let _ = conn.with_upgrades().await;
         });
     }
 }
