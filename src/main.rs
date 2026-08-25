@@ -277,9 +277,8 @@ async fn handle(
         .and_then(|h| CONFIG.site_for_host(h))
         .map(|s| s.upstream.clone());
 
-    // HTTP upgrade (WebSockets): proxy the upgrade request to upstream and
-    // let hyper's upgrade mechanism handle the bidirectional stream.
-    // Requires an existing session — unauthenticated WS upgrades are blocked.
+    // HTTP upgrade (WebSockets): always proxy through to the upstream.
+    // The backend handles its own auth for WS connections.
     let is_upgrade = req
         .headers()
         .get("upgrade")
@@ -287,11 +286,8 @@ async fn handle(
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
 
-    if is_upgrade && real_ip.map(is_allowed).unwrap_or(false) {
-        return match upstream {
-            Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
-            None => Ok(text_resp(StatusCode::BAD_REQUEST, "No upstream configured")),
-        };
+    if is_upgrade && upstream.is_some() {
+        return Ok(proxy_to_upstream(&client, req, &upstream.unwrap()).await);
     }
 
     if path == "/__ng/verify" && method == Method::POST {
