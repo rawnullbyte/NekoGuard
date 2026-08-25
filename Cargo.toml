@@ -30,6 +30,7 @@ toml = "1.1.4"
 tokio-util = { version = "0.7.19", features = ["compat"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 native-tls = "0.2.18"
+regex = "1.13.1"
 
 [build-dependencies]
 minify-html = "0.15"

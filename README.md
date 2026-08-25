@@ -39,8 +39,10 @@ port = 443                       # TLS listen port
 [[sites]]
 domain   = "example.com"
 upstream = "http://10.0.0.5:2368"
+bypass   = ["^/api/.*"]              # paths skipping the PoW challenge
 
-  # Subdomains nest under their parent; a sub without `upstream` inherits it.
+  # Subdomains nest under their parent; a sub without `upstream` or `bypass`
+  # inherits the parent's.
   [[sites.sub]]
   name     = "app"                    # app.example.com
   upstream = "http://10.0.0.6:8080"
@@ -48,6 +50,16 @@ upstream = "http://10.0.0.5:2368"
   [[sites.sub]]
   name = "www"                       # www.example.com → parent's upstream
 ```
+
+### Path bypass
+
+The optional per-site `bypass` list holds regexes matched against the request path (including the leading `/`). A match is proxied immediately without a challenge — for APIs and other machine-facing traffic:
+
+- `bypass = ["^/api/.*", "^/webhooks/.*"]` — exempt specific routes.
+- `bypass = [".*"]` — disable protection for that site entirely.
+- A sub sets its own list to override the parent's; `bypass = []` on a sub means fully protected even when the parent has bypasses.
+
+Bypassed requests skip PoW entirely and are exposed to bots — anchor patterns (`^/api/`) rather than using loose substrings. Upstream TLS certificates are not verified (nginx's `proxy_ssl_verify off` behavior), so self-signed backends work out of the box.
 
 Certificates are requested only for names in `domains`, cached in `cache_dir`, and renewed automatically before expiry. Set `staging = false` once your setup works; Let's Encrypt rate-limits production issuance.
 

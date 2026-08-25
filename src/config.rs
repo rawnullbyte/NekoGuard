@@ -14,6 +14,11 @@ const DEFAULT_CONFIG_PATH: &str = "nekoguard.toml";
 pub struct Site {
     pub domain: String,
     pub upstream: String,
+
+    /// Request paths matching any of these (against the full path,
+    /// including the leading `/`) are proxied WITHOUT the PoW challenge —
+    /// for APIs and other machine-facing routes. Empty = protect everything.
+    pub bypass: Vec<regex::Regex>,
 }
 
 /// On-disk shape of a `[[sites]]` block: the parent domain plus optional
@@ -28,6 +33,11 @@ struct SiteToml {
     /// whose DNS doesn't point at NekoGuard yet.
     #[serde(default)]
     upstream: String,
+
+    /// Regexes matched against the request path; matching requests skip the
+    /// PoW challenge. `[".*"]` disables protection for this site entirely.
+    #[serde(default)]
+    bypass: Vec<String>,
 
     /// Subdomains of `domain`. Each expands to `<name>.<domain>`; a sub
     /// without its own upstream inherits the parent's.
@@ -46,6 +56,10 @@ struct SubSiteToml {
     /// aliases like `www` need no extra configuration.
     #[serde(default)]
     upstream: Option<String>,
+
+    /// Bypass regexes for this subdomain; replaces the parent list when set.
+    #[serde(default)]
+    bypass: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,17 +144,35 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
     let mut sites: Vec<Site> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    let mut push = |domain: String, upstream: String| {
+    // Compile bypass patterns once at load; a bad regex fails startup naming
+    // the site rather than failing requests at runtime.
+    fn compile_bypass(domain: &str, patterns: &[String], path: &str) -> Vec<regex::Regex> {
+        patterns
+            .iter()
+            .map(|p| {
+                regex::Regex::new(p).unwrap_or_else(|e| {
+                    panic!("config '{path}': site '{domain}': bad bypass regex '{p}': {e}")
+                })
+            })
+            .collect()
+    }
+
+    let mut push = |domain: String, upstream: String, bypass: Vec<regex::Regex>| {
         let domain = normalize_host(&domain);
         if !seen.insert(domain.clone()) {
             panic!("config '{path}': duplicate site '{domain}'");
         }
-        sites.push(Site { domain, upstream });
+        sites.push(Site {
+            domain,
+            upstream,
+            bypass,
+        });
     };
 
     for s in raw.sites {
         if !s.upstream.is_empty() {
-            push(s.domain.clone(), s.upstream.clone());
+            let bypass = compile_bypass(&s.domain, &s.bypass, path);
+            push(s.domain.clone(), s.upstream.clone(), bypass);
         }
 
         for sub in s.sub {
@@ -149,7 +181,12 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
             else {
                 continue; // no upstream here or inherited: skip the whole site
             };
-            push(format!("{}.{}", sub.name, s.domain), upstream);
+            let full = format!("{}.{}", sub.name, s.domain);
+            let bypass = match sub.bypass {
+                Some(list) => compile_bypass(&full, &list, path),
+                None => compile_bypass(&full, &s.bypass, path), // inherit parent
+            };
+            push(full, upstream, bypass);
         }
     }
 

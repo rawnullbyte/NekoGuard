@@ -307,6 +307,22 @@ async fn handle(
         };
     }
 
+    // Path bypass: requests whose path matches one of the site's bypass
+    // regexes are proxied without the challenge (APIs and machine routes).
+    let host = req.headers().get("host").and_then(|v| v.to_str().ok());
+    if let Some(site) = host.and_then(|h| CONFIG.site_for_host(h)) {
+        let path = req.uri().path();
+        if site.bypass.iter().any(|re| re.is_match(path)) {
+            return match upstream {
+                Some(u) => Ok(proxy_to_upstream(&client, req, &u).await),
+                None => Ok(text_resp(
+                    StatusCode::BAD_REQUEST,
+                    "No upstream configured for this Host",
+                )),
+            };
+        }
+    }
+
     Ok(challenge_page(&pow::new_challenge(CHALLENGE_TTL)))
 }
 
@@ -385,9 +401,13 @@ async fn main() {
         .danger_accept_invalid_certs(true)
         .build()
         .expect("failed to build trusting TLS connector");
+    // enforce_http is on by default and would reject https:// upstream URLs
+    // before the TLS layer ever sees them.
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
     let client: ProxyClient = Client::builder(TokioExecutor::new())
-        .build(HttpsConnector::from((HttpConnector::new(), trust_tls.into())));
-    let clients = Arc::new(client);
+        .build(HttpsConnector::from((http_connector, trust_tls.into())));
+    let client = Arc::new(client);
 
     tokio::spawn(async {
         let mut tick = tokio::time::interval(Duration::from_secs(600));
@@ -449,7 +469,7 @@ async fn main() {
         let peer_ip = peer.ip();
         let challenge_rustls_config = challenge_rustls_config.clone();
         let default_rustls_config = default_rustls_config.clone();
-        let clients = Arc::clone(&clients);
+        let client = Arc::clone(&client);
 
         tokio::spawn(async move {
             let start_handshake = match LazyConfigAcceptor::new(Default::default(), tcp).await {
@@ -494,7 +514,7 @@ async fn main() {
             let _ = http1::Builder::new()
                 .serve_connection(
                     io,
-                    service_fn(move |req| handle(req, Arc::clone(&clients), peer_ip)),
+                    service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
                 )
                 .await;
         });

@@ -21,15 +21,30 @@ port = 443
 # issued automatically, only accepts TLS handshakes addressed to it, and
 # routes its authenticated traffic to its upstream.
 #
+# bypass: optional list of regexes matched against the request path; matching
+# requests skip the PoW challenge (APIs, machine-facing routes). A [".*"]
+# catch-all disables protection for that site entirely.
+#
+# An empty upstream skips the site entirely: no certificate is requested and
+# SNI handshakes for it are refused (useful while DNS points elsewhere).
+#
 # Subdomains nest under their parent via [[sites.sub]] and expand to
-# <name>.<domain>. A sub without its own upstream inherits the parent's.
+# <name>.<domain>. A sub without its own upstream or bypass inherits the
+# parent's.
 [[sites]]
 domain   = "root-workspace.net"
 upstream = "https://10.1.3.27:2368"
+bypass   = ["^/api/.*", "^/\\.well-known/"]
 
   [[sites.sub]]
   name     = "nekobox"
   upstream = "https://10.1.3.30:443"
+  bypass   = []                          # override: fully protect this sub
 
   [[sites.sub]]
-  name = "www"
+  name = "www"                           # inherits upstream + bypass
+
+[[sites]]
+domain   = "metrics.root-workspace.net"  # protection fully disabled here
+upstream = "http://10.1.3.40:9090"
+bypass   = [".*"]
