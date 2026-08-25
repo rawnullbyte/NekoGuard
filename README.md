@@ -39,6 +39,14 @@ port = 443                       # TLS listen port
 [[sites]]
 domain   = "example.com"
 upstream = "http://10.0.0.5:2368"
+
+  # Subdomains nest under their parent; a sub without `upstream` inherits it.
+  [[sites.sub]]
+  name     = "app"                    # app.example.com
+  upstream = "http://10.0.0.6:8080"
+
+  [[sites.sub]]
+  name = "www"                       # www.example.com → parent's upstream
 ```
 
 Certificates are requested only for names in `domains`, cached in `cache_dir`, and renewed automatically before expiry. Set `staging = false` once your setup works; Let's Encrypt rate-limits production issuance.

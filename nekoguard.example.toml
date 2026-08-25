@@ -20,6 +20,16 @@ port = 443
 # One entry per protected site. Each domain gets a Let's Encrypt certificate
 # issued automatically, only accepts TLS handshakes addressed to it, and
 # routes its authenticated traffic to its upstream.
+#
+# Subdomains nest under their parent via [[sites.sub]] and expand to
+# <name>.<domain>. A sub without its own upstream inherits the parent's.
 [[sites]]
 domain   = "root-workspace.net"
 upstream = "https://10.1.3.27:2368"
+
+  [[sites.sub]]
+  name     = "nekobox"
+  upstream = "https://10.1.3.30:443"
+
+  [[sites.sub]]
+  name = "www"

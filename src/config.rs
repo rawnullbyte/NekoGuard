@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::sync::LazyLock;
 
@@ -9,36 +10,64 @@ const DEFAULT_CONFIG_PATH: &str = "nekoguard.toml";
 
 /// One protected site: gets a certificate issued, answers its SNI handshakes,
 /// and routes its authenticated traffic to `upstream`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct Site {
     pub domain: String,
     pub upstream: String,
 }
 
+/// On-disk shape of a `[[sites]]` block: the parent domain plus optional
+/// nested subdomains.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
-    #[serde(default)]
-    pub sites: Vec<Site>,
+struct SiteToml {
+    domain: String,
+    upstream: String,
 
-    /// Contact addresses for the ACME account (email addresses; the
-    /// `mailto:` prefix is added automatically if missing).
+    /// Subdomains of `domain`. Each expands to `<name>.<domain>`; a sub
+    /// without its own upstream inherits the parent's.
     #[serde(default)]
-    pub contact: Vec<String>,
+    sub: Vec<SubSiteToml>,
+}
 
-    /// Directory where issued certificates and the ACME account key are
-    /// cached so they survive restarts and renew in place.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubSiteToml {
+    /// Label(s) prepended to the parent domain, e.g. `nekobox` under
+    /// `root-workspace.net` serves `nekobox.root-workspace.net`.
+    name: String,
+
+    /// Upstream for this subdomain. Defaults to the parent's upstream so
+    /// aliases like `www` need no extra configuration.
+    #[serde(default)]
+    upstream: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigToml {
+    #[serde(default)]
+    sites: Vec<SiteToml>,
+    #[serde(default)]
+    contact: Vec<String>,
     #[serde(default = "default_cache_dir")]
-    pub cache_dir: String,
-
-    /// Use the Let's Encrypt staging environment. Set true while testing to
-    /// avoid burning production rate limits; false issues real certificates.
+    cache_dir: String,
     #[serde(default)]
-    pub staging: bool,
-
-    /// TLS listen port. Defaults to 443.
+    staging: bool,
     #[serde(default = "default_port")]
+    port: u16,
+}
+
+/// Runtime config: the on-disk shape with `[[sites.sub]]` entries expanded
+/// into a flat list of (domain, upstream) pairs.
+#[derive(Debug)]
+pub struct Config {
+    /// Fully expanded site list (parent domains plus every `[[sites.sub]]`
+    /// flattened into its own entry). Sorted by domain for stable logs.
+    pub sites: Vec<Site>,
+    pub contact: Vec<String>,
+    pub cache_dir: String,
+    pub staging: bool,
     pub port: u16,
 }
 
@@ -90,18 +119,53 @@ impl Config {
     }
 }
 
+/// Expand the on-disk config into runtime form: flatten every `[[sites.sub]]`
+/// into a full domain entry, inheriting the parent upstream where absent.
+fn expand(raw: ConfigToml, path: &str) -> Config {
+    let mut sites: Vec<Site> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let mut push = |domain: String, upstream: String| {
+        let domain = normalize_host(&domain);
+        if !seen.insert(domain.clone()) {
+            panic!("config '{path}': duplicate site '{domain}'");
+        }
+        sites.push(Site { domain, upstream });
+    };
+
+    for s in raw.sites {
+        // Parent domain first so `sub` entries inherit its upstream.
+        let parent_upstream = s.upstream;
+        push(s.domain.clone(), parent_upstream.clone());
+
+        for sub in s.sub {
+            match sub.upstream {
+                Some(u) => push(format!("{}.{}", sub.name, s.domain), u),
+                None => push(format!("{}.{}", sub.name, s.domain), parent_upstream.clone()),
+            }
+        }
+    }
+
+    if sites.is_empty() {
+        panic!("config '{path}': at least one [[sites]] entry is required");
+    }
+
+    sites.sort_by(|a, b| a.domain.cmp(&b.domain));
+
+    Config {
+        sites,
+        contact: raw.contact,
+        cache_dir: raw.cache_dir,
+        staging: raw.staging,
+        port: raw.port,
+    }
+}
+
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     let path = std::env::var(CONFIG_PATH_ENV).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read config '{path}': {e}"));
-    let mut cfg: Config =
-        toml::from_str(&raw).unwrap_or_else(|e| panic!("failed to parse config '{path}': {e}"));
-    if cfg.sites.is_empty() {
-        panic!("config '{path}': at least one [[sites]] entry is required");
-    }
-    // Normalize domains once at load so runtime comparisons are exact.
-    for site in &mut cfg.sites {
-        site.domain = normalize_host(&site.domain);
-    }
-    cfg
+    let parsed: ConfigToml = toml::from_str(&raw)
+        .unwrap_or_else(|e| panic!("failed to parse config '{path}': {e}"));
+    expand(parsed, &path)
 });
