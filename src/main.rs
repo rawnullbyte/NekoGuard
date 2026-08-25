@@ -258,8 +258,8 @@ async fn handle(
         return Ok(serve_embedded_asset(asset_subpath));
     }
 
-    // Prefer X-Real-IP from a trusted front proxy; otherwise fall back to the
-    // TCP peer address (NekoGuard is the direct edge).
+    // Prefer X-Real-IP from a trusted front proxy; otherwise the TCP peer
+    // address (NekoGuard is the direct edge).
     let real_ip: Option<IpAddr> = req
         .headers()
         .get("x-real-ip")
@@ -267,20 +267,15 @@ async fn handle(
         .and_then(|s| s.parse().ok())
         .or(Some(peer_ip));
 
-    // Prefer an explicit X-Upstream header; otherwise resolve the upstream from
-    // the config's Host->upstream map so NekoGuard can route on its own.
+    // Routing is config-only: resolve the site from the request Host. The
+    // client-controlled X-Upstream header is deliberately ignored — trusting it
+    // would let anyone turn the proxy into an open proxy.
     let upstream = req
         .headers()
-        .get("x-upstream")
+        .get("host")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| {
-            req.headers()
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|h| CONFIG.upstream_for_host(h))
-                .map(str::to_string)
-        });
+        .and_then(|h| CONFIG.site_for_host(h))
+        .map(|s| s.upstream.clone());
 
     if path == "/__ng/verify" && method == Method::POST {
         let bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
@@ -403,7 +398,7 @@ async fn main() {
     // Build the ACME state for the fixed domain list. tokio_incoming would hide
     // the peer address, so we drive the low-level state ourselves and keep the
     // TCP peer IP for the allowlist fallback.
-    let mut acme_state = AcmeConfig::new(CONFIG.domains.clone())
+    let mut acme_state = AcmeConfig::new(CONFIG.sites.iter().map(|s| s.domain.clone()))
         .contact(CONFIG.acme_contacts())
         .cache(DirCache::new(CONFIG.cache_dir.clone()))
         .directory_lets_encrypt(!CONFIG.staging)
@@ -426,8 +421,8 @@ async fn main() {
     });
 
     println!(
-        "NekoGuard [:{port}] TLS edge — {} domain(s), {} permanent IP(s){}",
-        CONFIG.domains.len(),
+        "NekoGuard [:{port}] TLS edge — {} site(s), {} permanent IP(s){}",
+        CONFIG.sites.len(),
         PERM.len(),
         if CONFIG.staging { " [staging]" } else { "" }
     );
@@ -462,6 +457,19 @@ async fn main() {
                     let _ = tls.shutdown().await;
                 }
                 return;
+            }
+
+            // SNI allowlist: refuse handshakes for names we don't serve,
+            // mirroring nginx's unhandled-server_name behavior. (LE validation
+            // connections above are exempt — they arrive with the ACME ALPN.)
+            match start_handshake.client_hello().server_name() {
+                Some(name) if CONFIG.is_known_domain(name) => {}
+                _ => {
+                    eprintln!(
+                        "tls: refused handshake for unknown/absent SNI from {peer_ip}"
+                    );
+                    return;
+                }
             }
 
             let tls = match start_handshake.into_stream(default_rustls_config).await {

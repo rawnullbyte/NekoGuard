@@ -22,21 +22,23 @@ NekoGuard is a reverse proxy implemented in Rust designed to protect backend ser
 3. **Challenge Generation:** If unauthenticated, the client is served a challenge page.
 4. **Client-Side Computation:** The client's browser performs the work to find a nonce that satisfies the PoW requirement.
 5. **Validation:** Upon receiving a valid POST submission, the client's IP is granted access for a set duration (default 30 minutes).
-6. **Proxying:** Authenticated traffic is proxied to the upstream resolved from the `X-Upstream` header or the config's Host→upstream map.
+6. **Proxying:** Authenticated traffic is proxied to the upstream configured for the request's domain.
 
 ## Configuration
 
 NekoGuard reads a TOML config file at startup — `./nekoguard.toml` by default, overridable with the `NG_CONFIG` environment variable. See `nekoguard.example.toml`.
 
 ```toml
-domains = ["example.com"]        # domains to issue ACME certificates for
 contact = ["you@example.com"]    # ACME account contacts
 cache_dir = "./acme-cache"       # certificate/account cache location
 staging = true                   # LE staging while testing; false = production certs
 port = 443                       # TLS listen port
 
-[upstreams]                      # fallback Host -> upstream map
-"example.com" = "http://10.0.0.5:2368"
+# One entry per protected site: cert issuance, SNI filter, and routing.
+# Scalar keys must come BEFORE [[sites]] — TOML assigns later keys to the site.
+[[sites]]
+domain   = "example.com"
+upstream = "http://10.0.0.5:2368"
 ```
 
 Certificates are requested only for names in `domains`, cached in `cache_dir`, and renewed automatically before expiry. Set `staging = false` once your setup works; Let's Encrypt rate-limits production issuance.
@@ -55,7 +57,8 @@ Certificates are requested only for names in `domains`, cached in `cache_dir`, a
 
 ## Deployment Notes
 
-- NekoGuard binds ports 80 and 443, so run it with `CAP_NET_BIND_SERVICE`, as root, or via `setcap 'cap_net_bind_service=+ep' <binary>`.
-- DNS for every domain in `domains` must point at the machine running NekoGuard — that's how Let's Encrypt validates via TLS-ALPN-01.
-- When placed behind another reverse proxy instead, terminate TLS there, forward plain HTTP to NekoGuard's redirect listener, and set `X-Upstream`, `Host`, and `X-Forwarded-Proto`; the config `[upstreams]` map then serves purely as a fallback.
+- NekoGuard is a full edge reverse proxy — it replaces nginx entirely: TLS termination with auto-managed certificates, SNI-based site routing, and PoW protection in one process.
+- It binds ports 80 and 443, so run it with `CAP_NET_BIND_SERVICE`, as root, or via `setcap 'cap_net_bind_service=+ep' <binary>`.
+- DNS for every configured `domain` must point at the machine running NekoGuard — that's how Let's Encrypt validates via TLS-ALPN-01.
+- TLS handshakes for unknown domains are refused outright; routing is derived from each request's Host header against the `[[sites]]` table. The client-facing `X-Upstream` header is deliberately not trusted.
 - The proxy preserves the browser's `Origin`, `Referer`, and public `Host` headers so origin-checking applications like Ghost accept forwarded requests.

@@ -1,9 +1,8 @@
 # NekoGuard configuration.
 # Copy to nekoguard.toml (or point NG_CONFIG at this file) and edit.
 
-# Domains to obtain Let's Encrypt certificates for. Certificates are only ever
-# requested for names in this list.
-domains = ["root-workspace.net"]
+# NOTE: scalar settings must appear BEFORE the [[sites]] entries —
+# in TOML, keys written after a [[sites]] header belong to that site.
 
 # Contact addresses for the ACME account (expiry notices go here).
 contact = ["you@example.com"]
@@ -18,7 +17,9 @@ staging = true
 # TLS listen port.
 port = 443
 
-# Fallback Host -> upstream routing, used when a request has no X-Upstream
-# header (i.e. NekoGuard is the direct edge instead of sitting behind nginx).
-[upstreams]
-"root-workspace.net" = "https://10.1.3.27:2368"
+# One entry per protected site. Each domain gets a Let's Encrypt certificate
+# issued automatically, only accepts TLS handshakes addressed to it, and
+# routes its authenticated traffic to its upstream.
+[[sites]]
+domain   = "root-workspace.net"
+upstream = "https://10.1.3.27:2368"
