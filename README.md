@@ -25,24 +25,18 @@ A reverse proxy in Rust that protects backend services from automated bot traffi
 
 ```mermaid
 flowchart TB
-    Browser([Browser]) -->|HTTPS| LB[Load Balancer\nnginx / HAProxy]
-    LB -->|SNI routing| NG1[NekoGuard 1]
-    LB -->|SNI routing| NG2[NekoGuard 2]
-    LB -->|SNI routing| NG3[NekoGuard 3]
-    NG1 --- Redis[(Redis\nState Store)]
+    Browser([Browser]) --> LB[Load Balancer]
+    LB -->|SNI| NG[NekoGuard 1]
+    LB -->|SNI| NG2[NekoGuard 2]
+    LB -->|SNI| NG3[NekoGuard 3]
+    NG --- Redis[(Redis)]
     NG2 --- Redis
     NG3 --- Redis
-    NG1 --> Immich[Immich :2283]
-    NG1 --> Ghost[Ghost :2368]
-    NG2 --> Immich
-    NG2 --> Ghost
-    NG3 --> Custom[Custom Backend]
-
-    style Browser fill:#e1f5fe
-    style NG1 fill:#fff3e0
-    style NG2 fill:#fff3e0
-    style NG3 fill:#fff3e0
-    style Redis fill:#ffebee
+    NG --> S1[Service 1]
+    NG --> S2[Service 2]
+    NG2 --> S1
+    NG2 --> S2
+    NG3 --> S3[Service 3]
 ```
 
 > [!IMPORTANT]
@@ -116,7 +110,7 @@ bypass = ["^/api/.*"]                 # skip PoW for API routes
   [[sites.sub]]
   name = "www"                        # inherits parent's upstream
 
-  # Per-site rate limit override
+  # Subdomain with rate limit override
   [[sites.sub]]
   name = "api"
   upstream = "http://10.0.0.7:9000"
@@ -137,21 +131,37 @@ bypass = ["^/api/.*"]                 # skip PoW for API routes
 > [!NOTE]
 > Rate limits are enforced **after** a successful PoW solve. Each IP gets a token bucket that refills at `rps` tokens/second. If `rpm` is set, it acts as an additional per-minute ceiling.
 
-Per-site overrides merge on top of global defaults — only non-zero values override:
+Rate limits cascade: **global → domain → subdomain**. Non-zero values override:
 
 ```toml
+# Global (all sites)
 [rate_limit]
 rps = 10
 rpm = 600
 burst = 20
 
+# Domain override (applies to all subs)
 [[sites]]
-domain = "api.example.com"
-upstream = "http://10.0.0.7:9000"
+domain = "example.com"
+upstream = "http://10.0.0.5:2368"
 [site.rate_limit]
-rps = 100                              # overrides global rps
-rpm = 10000                            # overrides global rpm
-burst = 50                             # overrides global burst
+rps = 50
+rpm = 5000
+burst = 30
+
+  # Sub override (overrides both global AND domain)
+  [[sites.sub]]
+  name = "admin"
+  upstream = "http://10.0.0.8:8080"
+  [site.rate_limit]
+  rps = 5
+  rpm = 100
+  burst = 3
+
+  # Sub without rate_limit → inherits parent domain (example.com)
+  [[sites.sub]]
+  name = "api"
+  upstream = "http://10.0.0.7:9000"
 ```
 
 ### Environment Variables
@@ -192,13 +202,13 @@ NG_REDIS_URL=redis://localhost:6379 ./target/release/nekoguard
 
 ```mermaid
 flowchart LR
-    DNS[DNS] -->|example.com| LB[nginx stream SSL]
+    DNS[DNS] --> LB[Load Balancer]
     LB -->|SNI: example.com| R1[NekoGuard 1]
     LB -->|SNI: other.com| R2[NekoGuard 2]
     R1 --- Redis[(Redis)]
     R2 --- Redis
-    R1 --> B1[Immich :2283]
-    R1 --> B2[Ghost :2368]
+    R1 --> S1[Service 1]
+    R1 --> S2[Service 2]
 ```
 
 > [!TIP]
