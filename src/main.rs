@@ -366,10 +366,9 @@ async fn proxy_ws_upgrade_buf(client_tcp: &mut tokio::net::TcpStream, upstream_a
         }
     }
     rewritten.push_str("\r\n");
-    eprintln!("[ws] sending to upstream:\n{}", rewritten);
 
     if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
-        eprintln!("[ws] upstream write failed: {e}");
+        log::error!("[ws] upstream write failed: {e}");
         return;
     }
 
