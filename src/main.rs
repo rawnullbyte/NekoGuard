@@ -866,6 +866,7 @@ async fn main_inner() {
                         }
                     }
                     rewritten.push_str("\r\n");
+                    log::debug!("[ws-tls] sending to upstream:\n{}", rewritten.replace('\r', ""));
 
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
@@ -883,6 +884,8 @@ async fn main_inner() {
                         }
                         if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
                     }
+                    let resp_preview = String::from_utf8_lossy(&resp_buf);
+                    log::info!("[ws-tls] upstream responded: {}", resp_preview.lines().next().unwrap_or(""));
                     if !resp_buf.starts_with(b"HTTP/1.1 101") { return; }
 
                     // Split the TLS stream for bidirectional copy. The client
