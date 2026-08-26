@@ -803,16 +803,35 @@ async fn main_inner() {
                     }
                 }
             }
-            let is_ws = String::from_utf8_lossy(&header_bytes)
-                .to_ascii_lowercase()
-                .contains("upgrade: websocket");
-            // Recover the TLS stream from BufReader — remaining bytes
-            // (pipelined requests) are still inside and hyper will read them.
+            let hdr_preview = String::from_utf8_lossy(&header_bytes);
+            let is_ws = hdr_preview.to_ascii_lowercase().contains("upgrade: websocket");
+            eprintln!("[tls-ws] hdr {} bytes, is_ws={}, preview: {:?}",
+                header_bytes.len(), is_ws,
+                &hdr_preview[..hdr_preview.len().min(80)]);
+            // Recover the TLS stream from BufReader. BufReader may have read
+            // ahead into its internal buffer — those bytes are NOT in the TLS
+            // stream anymore. We must preserve them or they're lost.
+            let remaining: Vec<u8> = {
+                let buf = buf_reader.buffer();
+                let mut out = vec![0u8; buf.len()];
+                out.copy_from_slice(buf);
+                out
+            };
             let tls = buf_reader.into_inner();
+            // Combine header_bytes + any leftover buffered bytes into one prefix
+            // so both the WS path and non-WS path see the full request.
+            // Note: header_bytes already includes the \r\n\r\n terminator from
+            // read_until, and remaining starts AFTER it, so no double-terminator.
+            let hdr_for_ws = header_bytes.clone();
+            header_bytes.extend_from_slice(&remaining);
+            let tls = PrefixedReader {
+                prefix: std::io::Cursor::new(header_bytes),
+                inner: tls,
+            };
 
             if is_ws {
                 // Resolve the upstream from the Host header in the request.
-                let host = String::from_utf8_lossy(&header_bytes)
+                let host = String::from_utf8_lossy(&hdr_for_ws)
                     .lines()
                     .find(|l| l.to_ascii_lowercase().starts_with("host:"))
                     .and_then(|l| l.split_once(':').map(|x| x.1))
@@ -845,7 +864,7 @@ async fn main_inner() {
                     upstream_tcp.set_nodelay(true).ok();
 
                     // Rewrite request line + selective headers.
-                    let hdr_text = String::from_utf8_lossy(&header_bytes);
+                    let hdr_text = String::from_utf8_lossy(&hdr_for_ws);
                     let first_line = hdr_text.lines().next().unwrap_or("");
                     let fl_parts: Vec<&str> = first_line.split_whitespace().collect();
                     let ws_path = if fl_parts.len() >= 2 { fl_parts[1] } else { "/" };
@@ -908,13 +927,10 @@ async fn main_inner() {
                 return;
             }
 
-            // Non-upgrade: replay the already-read bytes through a prefixed
-            // wrapper so hyper sees the full request.
-            let prefixed = PrefixedReader {
-                prefix: std::io::Cursor::new(header_bytes),
-                inner: tls,
-            };
-            let io = TokioIo::new(prefixed);
+            // Non-upgrade: tls is already a PrefixedReader with headers
+            // + remaining bytes. Hyper reads headers from the prefix, then
+            // body from the TLS stream — no data loss.
+            let io = TokioIo::new(tls);
             let conn = http1::Builder::new().serve_connection(
                 io,
                 service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
