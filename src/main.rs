@@ -89,12 +89,9 @@ struct VerifyPayload {
     nonce: String,
 }
 
+/// Permanent whitelist IPs (from config whitelist list).
 static PERM: LazyLock<HashSet<IpAddr>> = LazyLock::new(|| {
-    std::env::var("NG_WHITELIST")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-        .collect()
+    CONFIG.whitelist.iter().cloned().collect()
 });
 
 
@@ -385,6 +382,7 @@ async fn handle(
     req: Request<Incoming>,
     client: Arc<ProxyClient>,
     session: Arc<session::SessionManager>,
+    redis_conn: Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
     peer_ip: IpAddr,
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
@@ -488,12 +486,14 @@ async fn handle(
 
     if allowed || bypass_match.is_some() {
         // Rate limit check (only for cookie-authenticated, not bypass)
-        if allowed && !bypass_match.is_some() {
+        if allowed && bypass_match.is_none() {
             if let Some(ip) = real_ip {
                 let site_rl = bypass_match
                     .map(|s| &s.rate_limit)
                     .unwrap_or(&CONFIG.rate_limit);
-                if !ratelimit::allow(ip, site_rl) {
+                let mut conn = redis_conn.lock().await;
+                if !ratelimit::allow(&mut conn, ip, site_rl).await {
+                    drop(conn);
                     ng_log::request_log(method.as_str(), &path, 429, &host_header, "rate-limited", start.elapsed().as_millis() as u64);
                     return Ok(text_resp(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
                 }
@@ -619,9 +619,7 @@ async fn main_inner() {
     let client = Arc::new(client);
 
     // Initialize Redis + session manager
-    let redis_url = std::env::var("NG_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let redis_client = redis::Client::open(redis_url.as_str())
+    let redis_client = redis::Client::open(CONFIG.redis_url.as_str())
         .expect("failed to connect to Redis");
     let sess = Arc::new(
         session::SessionManager::new_with_config(
@@ -632,13 +630,20 @@ async fn main_inner() {
     );
     log::info!("[session] session manager ready");
 
+    let redis_conn = Arc::new(
+        tokio::sync::Mutex::new(
+            redis_client.get_connection_manager()
+                .await
+                .expect("failed to connect to Redis"),
+        ),
+    );
+
     // Cleanup sweep: expire challenges and stale rate-limit buckets
     tokio::spawn(async {
         let mut tick = tokio::time::interval(Duration::from_secs(600));
         loop {
             tick.tick().await;
             pow::sweep();
-            ratelimit::sweep();
         }
     });
 
@@ -649,6 +654,7 @@ async fn main_inner() {
             log::info!("HTTP test listener on :{http_port}");
             let client = Arc::clone(&client);
             let sess = Arc::clone(&sess);
+            let redis_conn = Arc::clone(&redis_conn);
             tokio::spawn(async move {
                 loop {
                     let (mut tcp, peer) = match http_listener.accept().await {
@@ -662,6 +668,7 @@ async fn main_inner() {
                     let peer_ip = peer.ip();
                     let client = Arc::clone(&client);
                     let sess_c = Arc::clone(&sess);
+                    let redis_conn = Arc::clone(&redis_conn);
                     tokio::spawn(async move {
                         let sess = sess_c;
                         // Peek at the raw bytes to detect WebSocket upgrade
@@ -700,7 +707,7 @@ async fn main_inner() {
                         let conn = http1::Builder::new().serve_connection(
                             io,
                             service_fn(move |req| {
-                                handle(req, Arc::clone(&client), Arc::clone(&sess), peer_ip)
+                                handle(req, Arc::clone(&client), Arc::clone(&sess), Arc::clone(&redis_conn), peer_ip)
                             }),
                         );
                         let _ = conn.with_upgrades().await;
@@ -762,6 +769,7 @@ async fn main_inner() {
         let default_rustls_config = default_rustls_config.clone();
         let client = Arc::clone(&client);
         let sess = Arc::clone(&sess);
+        let redis_conn = Arc::clone(&redis_conn);
 
         tokio::spawn(async move {
             let start_handshake = match LazyConfigAcceptor::new(Default::default(), tcp).await {
@@ -926,7 +934,7 @@ async fn main_inner() {
             let io = TokioIo::new(prefixed);
             let conn = http1::Builder::new().serve_connection(
                 io,
-                service_fn(move |req| handle(req, Arc::clone(&client), Arc::clone(&sess), peer_ip)),
+                service_fn(move |req| handle(req, Arc::clone(&client), Arc::clone(&sess), Arc::clone(&redis_conn), peer_ip)),
             );
             let _ = conn.with_upgrades().await;
         });

@@ -1,61 +1,88 @@
-use dashmap::DashMap;
-use std::net::IpAddr;
-use std::sync::LazyLock;
-use std::time::{Duration, Instant};
-
 use crate::config::RateLimitConfig;
 
-struct Bucket {
-    tokens: f64,
-    last_refill: Instant,
-}
-
-/// Global rate limiter using per-IP token buckets.
-static BUCKETS: LazyLock<DashMap<IpAddr, Bucket>> = LazyLock::new(DashMap::new);
+const KEY_PREFIX: &str = "nekoguard:rl:";
 
 /// Check if an IP is allowed to make a request, consuming one token.
-/// Returns true if allowed, false if rate limited.
-pub fn allow(ip: IpAddr, config: &RateLimitConfig) -> bool {
+/// Uses Redis for state so it works across replicas.
+pub async fn allow(
+    conn: &mut redis::aio::ConnectionManager,
+    ip: std::net::IpAddr,
+    config: &RateLimitConfig,
+) -> bool {
     if !config.enabled || config.rps == 0 {
         return true;
     }
 
-    let now = Instant::now();
-    let max_tokens = config.burst as f64;
-    let refill_rate = config.rps as f64; // tokens per second
+    let key = format!("{}{}", KEY_PREFIX, ip);
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
 
-    let mut entry = BUCKETS.entry(ip).or_insert_with(|| Bucket {
-        tokens: max_tokens - 1.0, // first request costs one token
-        last_refill: now,
-    });
+    // Read current bucket state
+    let bucket: Option<(u64, u64)> = redis::cmd("HMGET")
+        .arg(&key)
+        .arg("tokens")
+        .arg("last_refill_ms")
+        .query_async(conn)
+        .await
+        .ok();
 
-    let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
+    let (tokens, last_refill_ms) = bucket.unwrap_or((config.burst as u64, now_ms));
 
     // Refill tokens based on elapsed time
-    let refill = elapsed * refill_rate;
-    entry.tokens = (entry.tokens + refill).min(max_tokens);
-    entry.last_refill = now;
+    let elapsed_ms = now_ms.saturating_sub(last_refill_ms);
+    let refill = (elapsed_ms as f64 / 1000.0) * config.rps as f64;
+    let new_tokens = ((tokens as f64 + refill).min(config.burst as f64)).floor() as u64;
 
     // Also enforce RPM limit
-    if config.rpm > 0 {
-        // RPM is handled as a simpler per-minute counter using the same bucket
-        // with a higher refill ceiling
-        let max_rpm = config.rpm as f64 / 60.0; // convert to per-second
-        let effective_max = max_tokens.max(max_rpm);
-        entry.tokens = entry.tokens.min(effective_max);
-    }
+    let max_rpm_tokens = if config.rpm > 0 {
+        config.rpm as u64
+    } else {
+        u64::MAX
+    };
 
-    if entry.tokens >= 1.0 {
-        entry.tokens -= 1.0;
+    if new_tokens >= 1 && new_tokens <= max_rpm_tokens {
+        // Consume one token
+        let new_tokens = new_tokens - 1;
+        let _: () = redis::cmd("HMSET")
+            .arg(&key)
+            .arg("tokens")
+            .arg(new_tokens)
+            .arg("last_refill_ms")
+            .arg(now_ms)
+            .query_async(conn)
+            .await
+            .ok()
+            .unwrap_or_default();
+        // Set expiry so keys don't grow forever (1 hour TTL)
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(3600)
+            .query_async(conn)
+            .await
+            .ok()
+            .unwrap_or_default();
         true
     } else {
+        // Rate limited — still update last_refill_ms so tokens refill correctly
+        let _: () = redis::cmd("HMSET")
+            .arg(&key)
+            .arg("tokens")
+            .arg(new_tokens.min(max_rpm_tokens))
+            .arg("last_refill_ms")
+            .arg(now_ms)
+            .query_async(conn)
+            .await
+            .ok()
+            .unwrap_or_default();
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(3600)
+            .query_async(conn)
+            .await
+            .ok()
+            .unwrap_or_default();
         false
     }
-}
-
-/// Remove stale buckets for IPs that haven't been seen in a while.
-pub fn sweep() {
-    let now = Instant::now();
-    let stale = Duration::from_secs(300); // 5 minutes
-    BUCKETS.retain(|_, b| now.duration_since(b.last_refill) < stale);
 }

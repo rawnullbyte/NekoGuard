@@ -24,47 +24,29 @@ A reverse proxy in Rust that protects backend services from automated bot traffi
 ## Architecture
 
 ```mermaid
-graph TB
-    subgraph "Internet"
-        Browser["🌐 Browser"]
-    end
-
-    subgraph "Load Balancer"
-        LB["⚖️ Load Balancer<br/>(nginx / HAProxy / Cloudflare)"]
-    end
-
-    subgraph "NekoGuard Cluster"
-        NG1["🛡️ NekoGuard #1<br/>:443 / :80"]
-        NG2["🛡️ NekoGuard #2<br/>:443 / :80"]
-        NG3["🛡️ NekoGuard #3<br/>:443 / :80"]
-    end
-
-    subgraph "State Store"
-        Redis["🔴 Redis<br/>Sessions + Secrets<br/>Rate Limits"]
-    end
-
-    subgraph "Backend Services"
-        Immich["📸 Immich"]
-        Ghost["📝 Ghost"]
-        Custom["🚀 Custom"]
-    end
-
-    Browser --> LB
-    LB --> NG1
-    LB --> NG2
-    LB --> NG3
-    NG1 --- Redis
+flowchart TB
+    Browser([Browser]) -->|HTTPS| LB[Load Balancer\nnginx / HAProxy]
+    LB -->|SNI routing| NG1[NekoGuard 1]
+    LB -->|SNI routing| NG2[NekoGuard 2]
+    LB -->|SNI routing| NG3[NekoGuard 3]
+    NG1 --- Redis[(Redis\nState Store)]
     NG2 --- Redis
     NG3 --- Redis
-    NG1 --> Immich
-    NG1 --> Ghost
+    NG1 --> Immich[Immich :2283]
+    NG1 --> Ghost[Ghost :2368]
     NG2 --> Immich
     NG2 --> Ghost
-    NG3 --> Custom
+    NG3 --> Custom[Custom Backend]
+
+    style Browser fill:#e1f5fe
+    style NG1 fill:#fff3e0
+    style NG2 fill:#fff3e0
+    style NG3 fill:#fff3e0
+    style Redis fill:#ffebee
 ```
 
 > [!IMPORTANT]
-> NekoGuard handles TLS termination, domain routing, and bot protection. The load balancer distributes traffic across replicas. Redis stores session state and rate limits shared across all replicas.
+> NekoGuard handles TLS termination, domain routing, and bot protection. The load balancer distributes traffic across replicas using TCP passthrough (SNI-based routing). Redis stores session state and signing secrets shared across all replicas.
 
 ---
 
@@ -96,6 +78,9 @@ staging = false                       # true = LE staging; false = production
 port = 443                            # TLS listen port
 # port_http = 8080                    # optional plain-HTTP test listener
 
+# ── Whitelist ─────────────────────────────────────────────────────
+whitelist = ["127.0.0.1"]             # permanent IPs that bypass PoW
+
 # ── Session ───────────────────────────────────────────────────────
 [session]
 cookie_name = "nekoguard_session"     # session cookie name
@@ -113,6 +98,10 @@ burst = 20                            # burst capacity
 level = "info"                        # error, warn, info, debug
 file = "/var/log/nekoguard.log"       # omit = stdout only
 requests = true                      # log each request with timing
+
+# ── Redis ─────────────────────────────────────────────────────────
+[redis]
+url = "redis://127.0.0.1:6379"        # session state + signing secret
 
 # ── Backend Sites ─────────────────────────────────────────────────
 [[sites]]
@@ -170,8 +159,6 @@ burst = 50                             # overrides global burst
 | Variable | Description |
 |----------|-------------|
 | `NG_CONFIG` | Path to the TOML config file (default: `nekoguard.toml`) |
-| `NG_WHITELIST` | Comma-separated IPs that bypass PoW permanently |
-| `NG_REDIS_URL` | Redis connection string (default: `redis://127.0.0.1:6379`) |
 
 ### Defaults
 
@@ -204,30 +191,14 @@ NG_REDIS_URL=redis://localhost:6379 ./target/release/nekoguard
 ### Multi-Replica with Load Balancer
 
 ```mermaid
-graph LR
-    subgraph "DNS"
-        DNS["🌐 DNS<br/>example.com → LB IP"]
-    end
-
-    subgraph "Infrastructure"
-        LB["⚖️ nginx / HAProxy<br/>stream { ssl_preread on; }"]
-        R1["🛡️ NG #1 :443"]
-        R2["🛡️ NG #2 :443"]
-        Redis["🔴 Redis<br/>:6379"]
-    end
-
-    subgraph "Backends"
-        B1["📸 Immich<br/>:2283"]
-        B2["📝 Ghost<br/>:2368"]
-    end
-
-    DNS --> LB
-    LB -->|"SNI: example.com"| R1
-    LB -->|"SNI: other.com"| R2
-    R1 --> Redis
-    R2 --> Redis
-    R1 --> B1
-    R1 --> B2
+flowchart LR
+    DNS[DNS] -->|example.com| LB[nginx stream SSL]
+    LB -->|SNI: example.com| R1[NekoGuard 1]
+    LB -->|SNI: other.com| R2[NekoGuard 2]
+    R1 --- Redis[(Redis)]
+    R2 --- Redis
+    R1 --> B1[Immich :2283]
+    R1 --> B2[Ghost :2368]
 ```
 
 > [!TIP]
@@ -272,7 +243,7 @@ NG_REDIS_URL=redis://127.0.0.1:6379
 
 **What Redis stores:**
 - `nekoguard:secret` — HMAC signing secret (shared across all replicas)
-- Rate limit counters (future: per-IP token buckets)
+- Rate limit state (currently in-memory; will move to Redis for multi-replica support)
 
 ---
 

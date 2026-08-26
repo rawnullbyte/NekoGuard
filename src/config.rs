@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
+use std::net::IpAddr;
 use std::sync::LazyLock;
 
 const DEFAULT_PORT: u16 = 443;
@@ -181,6 +182,14 @@ struct ConfigToml {
     /// Global rate limit defaults. Per-site overrides merge on top.
     #[serde(default)]
     rate_limit: RateLimitConfig,
+
+    /// Redis connection URL.
+    #[serde(default = "default_redis_url")]
+    redis_url: String,
+
+    /// Permanent IP whitelist — these IPs bypass PoW entirely.
+    #[serde(default)]
+    whitelist: Vec<String>,
 }
 
 /// Runtime config: the on-disk shape with `[[sites.sub]]` entries expanded
@@ -198,6 +207,8 @@ pub struct Config {
     pub log: LogConfig,
     pub session: SessionConfig,
     pub rate_limit: RateLimitConfig,
+    pub redis_url: String,
+    pub whitelist: Vec<IpAddr>,
 }
 
 fn default_cache_dir() -> String {
@@ -206,6 +217,10 @@ fn default_cache_dir() -> String {
 
 fn default_port() -> u16 {
     DEFAULT_PORT
+}
+
+fn default_redis_url() -> String {
+    "redis://127.0.0.1:6379".to_string()
 }
 
 /// Lowercase, strip any :port suffix and trailing dot so Host/SNI values
@@ -322,6 +337,10 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
 
     sites.sort_by(|a, b| a.domain.cmp(&b.domain));
 
+    let whitelist: Vec<IpAddr> = raw.whitelist.iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .collect();
+
     Config {
         sites,
         contact: raw.contact,
@@ -332,6 +351,8 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
         log: raw.log,
         session: raw.session,
         rate_limit: global_rl,
+        redis_url: raw.redis_url,
+        whitelist,
     }
 }
 
