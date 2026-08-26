@@ -353,30 +353,16 @@ async fn proxy_ws_upgrade(
     // Rewrite the request line to use the upstream's path only, and add
     // forwarded headers.
     let mut rewritten = format!("{} {} HTTP/1.1\r\n", parts[0], path);
-    let mut saw_host = false;
+    let authority = upstream_addr.split(':').next().unwrap_or(upstream_addr);
     for line in req_text[req_text.find("\r\n").unwrap_or(0) + 2..]
         .lines()
         .take_while(|l| !l.is_empty())
     {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("host:") {
-            // Rewrite to upstream authority
-            let authority = upstream_addr.split(':').next().unwrap_or(upstream_addr);
+        if line.to_ascii_lowercase().starts_with("host:") {
             rewritten.push_str(&format!("Host: {authority}\r\n"));
-            saw_host = true;
-        } else if lower.starts_with("connection:")
-            || lower.starts_with("upgrade:")
-            || lower.starts_with("sec-websocket")
-            || lower.starts_with("origin:")
-            || lower.starts_with("cookie:")
-        {
+        } else {
             rewritten.push_str(&format!("{line}\r\n"));
         }
-        // Skip all other headers (cookie, user-agent, etc. — not needed for WS)
-    }
-    if !saw_host {
-        let authority = upstream_addr.split(':').next().unwrap_or(upstream_addr);
-        rewritten.push_str(&format!("Host: {authority}\r\n"));
     }
     rewritten.push_str("\r\n");
 
@@ -863,33 +849,21 @@ async fn main_inner() {
                     };
                     upstream_tcp.set_nodelay(true).ok();
 
-                    // Rewrite request line + selective headers.
+                    // Forward ALL headers to upstream. Only rewrite Host.
                     let hdr_text = String::from_utf8_lossy(&hdr_for_ws);
                     let first_line = hdr_text.lines().next().unwrap_or("");
                     let fl_parts: Vec<&str> = first_line.split_whitespace().collect();
                     let ws_path = if fl_parts.len() >= 2 { fl_parts[1] } else { "/" };
                     let mut rewritten = format!("{} {} HTTP/1.1\r\n", fl_parts[0], ws_path);
-                    let mut saw_host = false;
+                    let auth = upstream.split(':').next().unwrap_or(&upstream);
                     for line in hdr_text[hdr_text.find("\r\n").unwrap_or(0) + 2..]
                         .lines().take_while(|l| !l.is_empty())
                     {
-                        let lower = line.to_ascii_lowercase();
-                        if lower.starts_with("host:") {
-                            let auth = upstream.split(':').next().unwrap_or(&upstream);
+                        if line.to_lowercase().starts_with("host:") {
                             rewritten.push_str(&format!("Host: {auth}\r\n"));
-                            saw_host = true;
-                        } else if lower.starts_with("connection:")
-                            || lower.starts_with("upgrade:")
-                            || lower.starts_with("sec-websocket")
-                            || lower.starts_with("origin:")
-                            || lower.starts_with("cookie:")
-                        {
+                        } else {
                             rewritten.push_str(&format!("{line}\r\n"));
                         }
-                    }
-                    if !saw_host {
-                        let auth = upstream.split(':').next().unwrap_or(&upstream);
-                        rewritten.push_str(&format!("Host: {auth}\r\n"));
                     }
                     rewritten.push_str("\r\n");
 
