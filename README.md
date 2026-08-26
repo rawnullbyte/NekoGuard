@@ -82,7 +82,6 @@ staging = false                       # true = LE staging; false = production
 
 # ── TLS ───────────────────────────────────────────────────────────
 port = 443                            # TLS listen port
-# port_http = 8080                    # optional plain-HTTP test listener
 
 # ── Whitelist ─────────────────────────────────────────────────────
 whitelist = ["127.0.0.1"]             # permanent IPs that bypass PoW
@@ -199,16 +198,22 @@ burst = 30
 ### Single Server
 
 ```bash
-# Build
-cargo build --release
+# Build both binaries
+cargo build --release --workspace
 
-# Run (needs ports 80 + 443)
+# Start Redis
+redis-server &
+
+# Start certd (handles ACME, issues certs)
+NG_CERTD_CONFIG=certd.toml ./target/release/nekoguard-certd
+
+# Start nekoguard (reads certs from Redis)
 sudo setcap 'cap_net_bind_service=+ep' target/release/nekoguard
-NG_REDIS_URL=redis://localhost:6379 ./target/release/nekoguard
+NG_CONFIG=nekoguard.toml ./target/release/nekoguard
 ```
 
 > [!CAUTION]
-> NekoGuard binds ports 80 and 443 directly. Run with `CAP_NET_BIND_SERVICE`, as root, or via `setcap`. DNS for every configured domain must point at this machine — that's how Let's Encrypt validates via TLS-ALPN-01.
+> NekoGuard binds ports 80 and 443 directly. Run with `CAP_NET_BIND_SERVICE`, as root, or via `setcap`.
 
 ### Multi-Replica with Load Balancer
 
@@ -256,29 +261,28 @@ stream {
 ## Redis
 
 > [!NOTE]
-> Redis is required for multi-replica deployments. For a single server, Redis still stores the signing secret but rate limiting works in-memory.
+> Redis stores session state, signing secrets, and rate limits. Required for multi-replica deployments.
 
 ```toml
-# In nekoguard.toml or via NG_REDIS_URL
-NG_REDIS_URL=redis://127.0.0.1:6379
+[redis]
+url = "redis://127.0.0.1:6379"
 ```
 
 **What Redis stores:**
 
 - `nekoguard:secret` — HMAC signing secret (shared across all replicas)
-- Rate limit state (currently in-memory; will move to Redis for multi-replica support)
+- `nekoguard:rl:<ip>` — Rate limit token bucket per IP (1 hour TTL)
+- `nekoguard:cert:<domain>` — Certs from certd (loaded on NekoGuard startup)
 
 ---
 
 ## TLS Certificates
 
-> [!TIP]
-> Start with `staging = true` to avoid burning Let's Encrypt production rate limits. Switch to `staging = false` once you've confirmed certs are issued successfully.
+Certificates are managed by `nekoguard-certd` and stored in Redis. NekoGuard reads them on startup and holds them in memory.
 
-Certificates are obtained via **TLS-ALPN-01** — NekoGuard answers ACME validation challenges directly on port 443. No HTTP server needed for certificate renewal.
-
-- Certificates are cached in `cache_dir` (default: `./acme-cache`)
-- Auto-renewed before expiry
+- certd handles issuance, renewal, and ACME challenges (via HTTP-01)
+- Certs are stored in Redis, shared across all NekoGuard replicas
+- NekoGuard loads certs from Redis on startup — no local cache needed
 - Unknown domains are refused at the TLS handshake level
 
 ---
@@ -300,33 +304,104 @@ When exceeded: `429 Too Many Requests`
 
 ## Certificate Daemon (certd)
 
-`nekoguard-certd` is a standalone service that handles all ACME certificate operations. Run it once — NekoGuard instances read certs from Redis.
+`nekoguard-certd` is a standalone service that handles all ACME certificate operations. It runs independently — once it issues a cert, it stores it in Redis, and all NekoGuard instances pick it up.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    LE[Let's Encrypt] -->|TLS-ALPN-01| CD[certd]
+    CD -->|cert + key| Redis[(Redis)]
+    Redis -->|cert| NG1[NekoGuard 1]
+    Redis -->|cert| NG2[NekoGuard 2]
+    Redis -->|cert| NG3[NekoGuard 3]
+```
+
+> [!IMPORTANT]
+> certd is a **single process** — no distributed locks needed. NekoGuard instances just read certs from Redis on startup.
+
+### Configuration
 
 ```toml
 # certd.toml
+
+# Domains to manage certificates for
 domains = ["root-workspace.net", "immich.root-workspace.net"]
+
+# ACME account contacts (expiry notices)
 contacts = ["you@example.com"]
+
+# Certificate cache directory (local fallback)
 cache_dir = "./acme-cache"
+
+# Use Let's Encrypt staging while testing
 staging = false
+
+# Listen port for NekoGuard to query (internal use)
 port = 8443
+
+# Redis connection
 redis_url = "redis://127.0.0.1:6379"
 ```
 
+Set the config path via environment variable:
+
 ```bash
-# Run certd
-NG_CERTD_CONFIG=certd.toml ./nekoguard-certd
+NG_CERTD_CONFIG=/etc/nekoguard/certd.toml ./nekoguard-certd
 ```
 
-**API endpoints:**
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/certs` | GET | List all certs |
-| `/certs/<domain>` | GET | Get cert for domain |
-| `/issue` | POST | Force certificate issuance |
+### Running
 
-> [!IMPORTANT]
-> certd handles issuance, renewal, and challenge validation. NekoGuard just reads certs from Redis on startup. No ACME code lives in the proxy binary.
+```bash
+# Build both binaries
+cargo build --workspace --release
+
+# Run certd (handles ACME)
+NG_CERTD_CONFIG=/etc/nekoguard/certd.toml ./target/release/nekoguard-certd
+
+# Run nekoguard (reads certs from Redis)
+NG_CONFIG=/etc/nekoguard/nekoguard.toml ./target/release/nekoguard
+```
+
+### API Reference
+
+| Endpoint | Method | Description | Response |
+|----------|--------|-------------|----------|
+| `/health` | `GET` | Health check | `{"status":"ok"}` |
+| `/certs` | `GET` | List all managed certs | `[[domain, {cert_pem, key_pem}]]` |
+| `/certs/<domain>` | `GET` | Get cert for a specific domain | `{cert_pem, key_pem}` |
+| `/issue` | `POST` | Force certificate issuance for all domains | `{"status":"issued"}` |
+
+Example: check if a cert exists
+
+```bash
+curl http://localhost:8443/certs/root-workspace.net
+```
+
+```json
+{
+  "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+  "key_pem": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
+}
+```
+
+### How NekoGuard uses certd
+
+On startup, NekoGuard:
+1. Checks Redis for existing certs for each configured domain
+2. If found → writes to local DirCache for fast TLS handshakes
+3. If not found → waits for certd to issue (certd runs independently)
+4. Caches certs locally so NekoGuard doesn't hit Redis on every TLS handshake
+
+NekoGuard does **not** communicate with certd directly over HTTP — it reads certs from Redis. certd just stores them there after issuance.
+
+### Redis storage
+
+| Key | Value | TTL |
+|-----|-------|-----|
+| `nekoguard:cert:<domain>` | JSON `{cert_pem, key_pem}` | None (persists) |
+| `nekoguard:secret` | HMAC signing secret | None (persists) |
+| `nekoguard:rl:<ip>` | Rate limit bucket `{tokens, last_refill_ms}` | 1 hour |
 
 ---
 

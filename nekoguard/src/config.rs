@@ -5,7 +5,6 @@ use std::net::IpAddr;
 use std::sync::LazyLock;
 
 const DEFAULT_PORT: u16 = 443;
-const DEFAULT_CACHE_DIR: &str = "./acme-cache";
 const CONFIG_PATH_ENV: &str = "NG_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "nekoguard.toml";
 
@@ -158,12 +157,6 @@ impl Default for RateLimitConfig {
 struct ConfigToml {
     #[serde(default)]
     sites: Vec<SiteToml>,
-    #[serde(default)]
-    contact: Vec<String>,
-    #[serde(default = "default_cache_dir")]
-    cache_dir: String,
-    #[serde(default)]
-    staging: bool,
     #[serde(default = "default_port")]
     port: u16,
 
@@ -196,12 +189,7 @@ struct ConfigToml {
 /// into a flat list of (domain, upstream) pairs.
 #[derive(Debug)]
 pub struct Config {
-    /// Fully expanded site list (parent domains plus every `[[sites.sub]]`
-    /// flattened into its own entry). Sorted by domain for stable logs.
     pub sites: Vec<Site>,
-    pub contact: Vec<String>,
-    pub cache_dir: String,
-    pub staging: bool,
     pub port: u16,
     pub port_http: Option<u16>,
     pub log: LogConfig,
@@ -209,10 +197,6 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     pub redis_url: String,
     pub whitelist: Vec<IpAddr>,
-}
-
-fn default_cache_dir() -> String {
-    DEFAULT_CACHE_DIR.to_string()
 }
 
 fn default_port() -> u16 {
@@ -234,20 +218,6 @@ fn normalize_host(host: &str) -> String {
 }
 
 impl Config {
-    /// Normalized contact list with `mailto:` prefixes for rustls-acme.
-    pub fn acme_contacts(&self) -> Vec<String> {
-        self.contact
-            .iter()
-            .map(|c| {
-                if c.contains(':') {
-                    c.clone()
-                } else {
-                    format!("mailto:{c}")
-                }
-            })
-            .collect()
-    }
-
     /// Find the site a request Host header belongs to.
     pub fn site_for_host(&self, host: &str) -> Option<&Site> {
         let want = normalize_host(host);
@@ -343,9 +313,6 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
 
     Config {
         sites,
-        contact: raw.contact,
-        cache_dir: raw.cache_dir,
-        staging: raw.staging,
         port: raw.port,
         port_http: raw.port_http,
         log: raw.log,

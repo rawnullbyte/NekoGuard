@@ -14,21 +14,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
-        
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Release
-        run: cargo build --release --verbose
+      - name: Build workspace
+        run: cargo build --workspace --release --verbose
 
-      - name: Upload Binary
+      - name: Upload nekoguard binary
         uses: actions/upload-artifact@v4
         with:
           name: nekoguard-linux
           path: target/release/nekoguard
-          
+
+      - name: Upload certd binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nekoguard-certd-linux
+          path: target/release/nekoguard-certd
+
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose

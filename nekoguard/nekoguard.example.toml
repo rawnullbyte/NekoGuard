@@ -4,16 +4,6 @@
 # NOTE: scalar settings must appear BEFORE the [[sites]] entries —
 # in TOML, keys written after a [[sites]] header belong to that site.
 
-# Contact addresses for the ACME account (expiry notices go here).
-contact = ["you@example.com"]
-
-# Where certificates and the ACME account key are cached.
-cache_dir = "./acme-cache"
-
-# Use the Let's Encrypt staging environment while testing (rate-limit friendly).
-# Set false for real certificates.
-staging = true
-
 # TLS listen port.
 port = 443
 
