@@ -1,11 +1,14 @@
 mod config;
 mod ng_log;
 mod pow;
+mod ratelimit;
+mod session;
 
 use bytes::Bytes;
 use config::CONFIG;
-use dashmap::DashMap;
 use futures::StreamExt;
+
+
 use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue};
@@ -22,7 +25,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::LazyConfigAcceptor;
@@ -72,7 +75,6 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedReader<
 const CHALLENGE_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/challenge.min.html"));
 const MAX_VERIFY_BODY: usize = 512;
 const CHALLENGE_TTL: Duration = Duration::from_secs(300); // 5 min
-const TEMP_TTL: Duration = Duration::from_secs(1800); // 30 min
 
 type RespBody = BoxBody<Bytes, hyper::Error>;
 type ProxyClient = Client<HttpsConnector<HttpConnector>, RespBody>;
@@ -94,30 +96,6 @@ static PERM: LazyLock<HashSet<IpAddr>> = LazyLock::new(|| {
         .filter_map(|s| s.trim().parse::<IpAddr>().ok())
         .collect()
 });
-
-/// IPs temporarily whitelisted for a fixed duration after solving the PoW.
-static TEMP_WHITELIST: LazyLock<DashMap<IpAddr, Instant>> =
-    LazyLock::new(DashMap::new);
-
-/// Whether an IP is whitelisted — either permanently or temporarily.
-fn is_whitelisted(ip: IpAddr) -> bool {
-    if PERM.contains(&ip) {
-        return true;
-    }
-    match TEMP_WHITELIST.get(&ip) {
-        Some(expiry) if *expiry > Instant::now() => true,
-        Some(_) => {
-            TEMP_WHITELIST.remove(&ip);
-            false
-        }
-        None => false,
-    }
-}
-
-/// Whitelist an IP for TEMP_TTL after a valid PoW solution.
-fn whitelist_temp(ip: IpAddr) {
-    TEMP_WHITELIST.insert(ip, Instant::now() + TEMP_TTL);
-}
 
 
 // Response helpers
@@ -406,6 +384,7 @@ async fn proxy_ws_upgrade_buf(client_tcp: &mut tokio::net::TcpStream, upstream_a
 async fn handle(
     req: Request<Incoming>,
     client: Arc<ProxyClient>,
+    session: Arc<session::SessionManager>,
     peer_ip: IpAddr,
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
@@ -457,13 +436,70 @@ async fn handle(
             return Ok(text_resp(StatusCode::FORBIDDEN, "Invalid solution"));
         }
 
+        // PoW valid — create a signed session cookie
         if let Some(ip) = real_ip {
-            whitelist_temp(ip);
+            let cookie_val = session.create_cookie(ip);
+            let resp = text_resp(StatusCode::OK, "OK");
+            let cookie_header = format!(
+                "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+                session.cookie_name(), cookie_val, session.ttl().as_secs()
+            );
+            let mut resp = resp;
+            resp.headers_mut().insert(
+                "set-cookie",
+                HeaderValue::from_str(&cookie_header).unwrap(),
+            );
+            return Ok(resp);
         }
         return Ok(text_resp(StatusCode::OK, "OK"));
     }
 
-    if real_ip.map(is_whitelisted).unwrap_or(false) {
+    // Check session cookie — extract, verify signature, check IP, check expiry
+    let session_valid = req.headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| {
+            c.split(';')
+                .find(|part| part.trim().starts_with(&format!("{}=", session.cookie_name())))
+                .map(|part| part.trim().splitn(2, '=').nth(1).unwrap_or(""))
+        })
+        .and_then(|val| {
+            let ip = real_ip?;
+            session.verify_cookie(val, ip).ok()
+        })
+        .is_some();
+
+    // Also allow permanent whitelist IPs
+    let allowed = session_valid || real_ip.map(|ip| PERM.contains(&ip)).unwrap_or(false);
+
+    // Path bypass: requests whose path matches one of the site's bypass
+    // regexes are proxied without the challenge (APIs and machine routes).
+    let host = req.headers().get("host").and_then(|v| v.to_str().ok());
+    let bypass_match = host
+        .and_then(|h| CONFIG.site_for_host(h))
+        .and_then(|site| {
+            let req_path = req.uri().path();
+            if site.bypass.iter().any(|re| re.is_match(req_path)) {
+                Some(site)
+            } else {
+                None
+            }
+        });
+
+    if allowed || bypass_match.is_some() {
+        // Rate limit check (only for cookie-authenticated, not bypass)
+        if allowed && !bypass_match.is_some() {
+            if let Some(ip) = real_ip {
+                let site_rl = bypass_match
+                    .map(|s| &s.rate_limit)
+                    .unwrap_or(&CONFIG.rate_limit);
+                if !ratelimit::allow(ip, site_rl) {
+                    ng_log::request_log(method.as_str(), &path, 429, &host_header, "rate-limited", start.elapsed().as_millis() as u64);
+                    return Ok(text_resp(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
+                }
+            }
+        }
+
         return match upstream {
             Some(u) => {
                 let resp = proxy_to_upstream(&client, req, &u).await;
@@ -475,26 +511,6 @@ async fn handle(
                 "No upstream configured for this Host",
             )),
         };
-    }
-
-    // Path bypass: requests whose path matches one of the site's bypass
-    // regexes are proxied without the challenge (APIs and machine routes).
-    let host = req.headers().get("host").and_then(|v| v.to_str().ok());
-    if let Some(site) = host.and_then(|h| CONFIG.site_for_host(h)) {
-        let req_path = req.uri().path().to_string();
-        if site.bypass.iter().any(|re| re.is_match(&req_path)) {
-            return match upstream {
-                Some(u) => {
-                    let resp = proxy_to_upstream(&client, req, &u).await;
-                    ng_log::request_log(method.as_str(), &req_path, resp.status().as_u16(), &host_header, &u, start.elapsed().as_millis() as u64);
-                    Ok(resp)
-                }
-                None => Ok(text_resp(
-                    StatusCode::BAD_REQUEST,
-                    "No upstream configured for this Host",
-                )),
-            };
-        }
     }
 
     let resp = challenge_page(&pow::new_challenge(CHALLENGE_TTL));
@@ -602,24 +618,37 @@ async fn main_inner() {
         .build(HttpsConnector::from((http_connector, trust_tls.into())));
     let client = Arc::new(client);
 
+    // Initialize Redis + session manager
+    let redis_url = std::env::var("NG_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_client = redis::Client::open(redis_url.as_str())
+        .expect("failed to connect to Redis");
+    let sess = Arc::new(
+        session::SessionManager::new_with_config(
+            &redis_client,
+            &CONFIG.session.cookie_name,
+            Duration::from_secs(CONFIG.session.ttl),
+        ).await,
+    );
+    log::info!("[session] session manager ready");
+
+    // Cleanup sweep: expire challenges and stale rate-limit buckets
     tokio::spawn(async {
         let mut tick = tokio::time::interval(Duration::from_secs(600));
         loop {
             tick.tick().await;
             pow::sweep();
-            let now = Instant::now();
-            TEMP_WHITELIST.retain(|_, exp| now < *exp);
+            ratelimit::sweep();
         }
     });
 
     tokio::spawn(run_http_redirect());
-
-    // Optional plain-HTTP listener for local testing without TLS.
     if let Some(http_port) = CONFIG.port_http {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
         if let Ok(http_listener) = TcpListener::bind(addr).await {
             log::info!("HTTP test listener on :{http_port}");
             let client = Arc::clone(&client);
+            let sess = Arc::clone(&sess);
             tokio::spawn(async move {
                 loop {
                     let (mut tcp, peer) = match http_listener.accept().await {
@@ -632,7 +661,9 @@ async fn main_inner() {
                     tcp.set_nodelay(true).ok();
                     let peer_ip = peer.ip();
                     let client = Arc::clone(&client);
+                    let sess_c = Arc::clone(&sess);
                     tokio::spawn(async move {
+                        let sess = sess_c;
                         // Peek at the raw bytes to detect WebSocket upgrade
                         // before hyper consumes them.
                         let mut peek_buf = [0u8; 4096];
@@ -669,7 +700,7 @@ async fn main_inner() {
                         let conn = http1::Builder::new().serve_connection(
                             io,
                             service_fn(move |req| {
-                                handle(req, Arc::clone(&client), peer_ip)
+                                handle(req, Arc::clone(&client), Arc::clone(&sess), peer_ip)
                             }),
                         );
                         let _ = conn.with_upgrades().await;
@@ -730,6 +761,7 @@ async fn main_inner() {
         let challenge_rustls_config = challenge_rustls_config.clone();
         let default_rustls_config = default_rustls_config.clone();
         let client = Arc::clone(&client);
+        let sess = Arc::clone(&sess);
 
         tokio::spawn(async move {
             let start_handshake = match LazyConfigAcceptor::new(Default::default(), tcp).await {
@@ -894,7 +926,7 @@ async fn main_inner() {
             let io = TokioIo::new(prefixed);
             let conn = http1::Builder::new().serve_connection(
                 io,
-                service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
+                service_fn(move |req| handle(req, Arc::clone(&client), Arc::clone(&sess), peer_ip)),
             );
             let _ = conn.with_upgrades().await;
         });

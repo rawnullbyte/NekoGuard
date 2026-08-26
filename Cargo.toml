@@ -32,6 +32,9 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 native-tls = "0.2.18"
 regex = "1.13.1"
 log = "0.4.34"
+redis = { version = "1.6.0", features = ["tokio-comp"] }
+hmac = { version = "0.12", features = ["std"] }
+base64 = "0.23.1"
 
 [build-dependencies]
 minify-html = "0.15"

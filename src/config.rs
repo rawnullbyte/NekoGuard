@@ -19,6 +19,9 @@ pub struct Site {
     /// including the leading `/`) are proxied WITHOUT the PoW challenge —
     /// for APIs and other machine-facing routes. Empty = protect everything.
     pub bypass: Vec<regex::Regex>,
+
+    /// Effective rate limit for this site (global defaults + per-site overrides).
+    pub rate_limit: RateLimitConfig,
 }
 
 /// On-disk shape of a `[[sites]]` block: the parent domain plus optional
@@ -38,6 +41,10 @@ struct SiteToml {
     /// PoW challenge. `[".*"]` disables protection for this site entirely.
     #[serde(default)]
     bypass: Vec<String>,
+
+    /// Per-site rate limit overrides (inherits global defaults for unset fields).
+    #[serde(default)]
+    rate_limit: Option<RateLimitConfig>,
 
     /// Subdomains of `domain`. Each expands to `<name>.<domain>`; a sub
     /// without its own upstream inherits the parent's.
@@ -60,6 +67,10 @@ struct SubSiteToml {
     /// Bypass regexes for this subdomain; replaces the parent list when set.
     #[serde(default)]
     bypass: Option<Vec<String>>,
+
+    /// Per-site rate limit overrides; inherits parent if not set.
+    #[serde(default)]
+    rate_limit: Option<RateLimitConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -88,6 +99,59 @@ fn default_log_level() -> String { "info".to_string() }
 fn default_max_size() -> u64 { 10 * 1024 * 1024 }
 fn default_true() -> bool { true }
 
+/// Session cookie configuration.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Cookie name. Default: "nekoguard_session".
+    #[serde(default = "default_cookie_name")]
+    pub cookie_name: String,
+
+    /// Session duration in seconds. Default: 1800 (30 min).
+    #[serde(default = "default_session_ttl")]
+    pub ttl: u64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self { cookie_name: default_cookie_name(), ttl: default_session_ttl() }
+    }
+}
+
+fn default_cookie_name() -> String { "nekoguard_session".to_string() }
+fn default_session_ttl() -> u64 { 1800 }
+
+/// Rate limit configuration. Can be set globally and overridden per-site.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Enable rate limiting. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Max requests per second (0 = unlimited). Default: 10.
+    #[serde(default = "default_rps")]
+    pub rps: u32,
+
+    /// Max requests per minute (0 = unlimited). Default: 600.
+    #[serde(default = "default_rpm")]
+    pub rpm: u32,
+
+    /// Burst capacity (tokens above the rps rate). Default: 20.
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+}
+
+fn default_rps() -> u32 { 10 }
+fn default_rpm() -> u32 { 600 }
+fn default_burst() -> u32 { 20 }
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self { enabled: false, rps: default_rps(), rpm: default_rpm(), burst: default_burst() }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigToml {
@@ -109,6 +173,14 @@ struct ConfigToml {
     /// Logging configuration.
     #[serde(default)]
     log: LogConfig,
+
+    /// Session cookie configuration.
+    #[serde(default)]
+    session: SessionConfig,
+
+    /// Global rate limit defaults. Per-site overrides merge on top.
+    #[serde(default)]
+    rate_limit: RateLimitConfig,
 }
 
 /// Runtime config: the on-disk shape with `[[sites.sub]]` entries expanded
@@ -124,6 +196,8 @@ pub struct Config {
     pub port: u16,
     pub port_http: Option<u16>,
     pub log: LogConfig,
+    pub session: SessionConfig,
+    pub rate_limit: RateLimitConfig,
 }
 
 fn default_cache_dir() -> String {
@@ -177,6 +251,7 @@ impl Config {
 /// Expand the on-disk config into runtime form: flatten every `[[sites.sub]]`
 /// into a full domain entry, inheriting the parent upstream where absent.
 fn expand(raw: ConfigToml, path: &str) -> Config {
+    let global_rl = raw.rate_limit;
     let mut sites: Vec<Site> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -193,22 +268,32 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
             .collect()
     }
 
-    let mut push = |domain: String, upstream: String, bypass: Vec<regex::Regex>| {
+    // Merge a per-site RateLimitConfig on top of the global defaults.
+    // Only non-default fields override (0/0/0 means "use global").
+    fn merge_rl(global: &RateLimitConfig, override_rl: &RateLimitConfig) -> RateLimitConfig {
+        RateLimitConfig {
+            enabled: global.enabled || override_rl.enabled,
+            rps: if override_rl.rps > 0 { override_rl.rps } else { global.rps },
+            rpm: if override_rl.rpm > 0 { override_rl.rpm } else { global.rpm },
+            burst: if override_rl.burst > 0 { override_rl.burst } else { global.burst },
+        }
+    }
+
+    let mut push = |domain: String, upstream: String, bypass: Vec<regex::Regex>, rl: RateLimitConfig| {
         let domain = normalize_host(&domain);
         if !seen.insert(domain.clone()) {
             panic!("config '{path}': duplicate site '{domain}'");
         }
-        sites.push(Site {
-            domain,
-            upstream,
-            bypass,
-        });
+        sites.push(Site { domain, upstream, bypass, rate_limit: rl });
     };
 
     for s in raw.sites {
         if !s.upstream.is_empty() {
             let bypass = compile_bypass(&s.domain, &s.bypass, path);
-            push(s.domain.clone(), s.upstream.clone(), bypass);
+            let rl = s.rate_limit.as_ref()
+                .map(|r| merge_rl(&global_rl, r))
+                .unwrap_or_else(|| global_rl.clone());
+            push(s.domain.clone(), s.upstream.clone(), bypass, rl);
         }
 
         for sub in s.sub {
@@ -220,9 +305,12 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
             let full = format!("{}.{}", sub.name, s.domain);
             let bypass = match sub.bypass {
                 Some(list) => compile_bypass(&full, &list, path),
-                None => compile_bypass(&full, &s.bypass, path), // inherit parent
+                None => compile_bypass(&full, &s.bypass, path),
             };
-            push(full, upstream, bypass);
+            let rl = sub.rate_limit.as_ref()
+                .map(|r| merge_rl(&global_rl, r))
+                .unwrap_or_else(|| global_rl.clone());
+            push(full, upstream, bypass, rl);
         }
     }
 
@@ -242,6 +330,8 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
         port: raw.port,
         port_http: raw.port_http,
         log: raw.log,
+        session: raw.session,
+        rate_limit: global_rl,
     }
 }
 
