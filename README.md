@@ -70,16 +70,11 @@ flowchart TB
 ## Configuration
 
 > [!NOTE]
-> Scalar keys (`contact`, `cache_dir`, `staging`, `port`, `log`, `session`, `rate_limit`) must appear **before** any `[[sites]]` block in the TOML file. This is a TOML language requirement.
+> Scalar keys (`port`, `log`, `session`, `rate_limit`, `redis`) must appear **before** any `[[sites]]` block in the TOML file. This is a TOML language requirement.
 
 ### Full Config Example
 
 ```toml
-# ── ACME ──────────────────────────────────────────────────────────
-contact = ["you@example.com"]         # ACME account contacts
-cache_dir = "./acme-cache"            # certificate cache directory
-staging = false                       # true = LE staging; false = production
-
 # ── TLS ───────────────────────────────────────────────────────────
 port = 443                            # TLS listen port
 

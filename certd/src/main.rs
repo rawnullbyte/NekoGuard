@@ -2,10 +2,10 @@ mod acme;
 mod config;
 
 use config::CONFIG;
+use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use std::convert::Infallible;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 
 type RespBody = http_body_util::Full<bytes::Bytes>;
@@ -19,8 +19,7 @@ fn json_resp(status: StatusCode, body: &str) -> Response<RespBody> {
 }
 
 async fn handle(
-    req: Request<hyper::body::Incoming>,
-    acme: Arc<acme::AcmeManager>,
+    req: Request<Incoming>,
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path();
     let method = req.method();
@@ -31,15 +30,24 @@ async fn handle(
         }
 
         (&Method::GET, "/certs") => {
-            // Return all certs
-            let certs = acme.get_all_certs().await;
+            let mut conn = redis::Client::open(CONFIG.redis_url.as_str())
+                .expect("redis connect")
+                .get_connection_manager()
+                .await
+                .expect("redis conn manager");
+            let certs = acme::get_all_certs(&mut conn).await;
             let json = serde_json::to_string(&certs).unwrap_or_else(|_| "[]".to_string());
             Ok(json_resp(StatusCode::OK, &json))
         }
 
         (&Method::GET, p) if p.starts_with("/certs/") => {
-            let domain = &p[7..]; // strip "/certs/"
-            match acme.get_cert(domain).await {
+            let domain = &p[7..];
+            let mut conn = redis::Client::open(CONFIG.redis_url.as_str())
+                .expect("redis connect")
+                .get_connection_manager()
+                .await
+                .expect("redis conn manager");
+            match acme::load_cert(&mut conn, domain).await {
                 Some(cert) => {
                     let json = serde_json::to_string(&cert).unwrap_or_default();
                     Ok(json_resp(StatusCode::OK, &json))
@@ -54,21 +62,20 @@ async fn handle(
 
 #[tokio::main]
 async fn main() {
-    // Simple stderr logger for certd
+    // Simple stderr logger
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .init();
+
     log::info!("nekoguard-certd starting on :{}", CONFIG.port);
 
-    let acme = Arc::new(acme::AcmeManager::new().await);
-    let acme_clone = Arc::clone(&acme);
-
-    // Start ACME event loop
+    // Start ACME issuance/renewal loop in background
+    let redis_url = CONFIG.redis_url.clone();
     tokio::spawn(async move {
-        acme_clone.run_event_loop().await;
+        acme::run_acme_loop(&redis_url).await;
     });
 
-    // HTTP server
+    // HTTP server for cert queries
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], CONFIG.port));
     let listener = TcpListener::bind(addr).await.expect("bind failed");
     log::info!("nekoguard-certd ready on :{}", CONFIG.port);
@@ -78,11 +85,10 @@ async fn main() {
             Ok(c) => c,
             Err(e) => { log::error!("accept: {e}"); continue; }
         };
-        let acme = Arc::clone(&acme);
         tokio::spawn(async move {
             let io = hyper_util::rt::TokioIo::new(tcp);
             let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service_fn(move |req| handle(req, Arc::clone(&acme))))
+                .serve_connection(io, service_fn(handle))
                 .await;
         });
     }
