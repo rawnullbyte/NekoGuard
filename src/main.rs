@@ -299,26 +299,26 @@ async fn proxy_to_upstream(
 // abstraction cannot pipe these bytes — it finishes immediately — so we
 // bypass it entirely: read the request ourselves, forward to the upstream,
 // read back the101, send it to the client, then copy raw bytes both ways.
-async fn proxy_ws_upgrade(
-    mut client_tcp: tokio::net::TcpStream,
-    upstream_addr: &str,
-) {
+/// Forward a WS request to the upstream over TCP. Reads the request
+/// from `client_tcp`, rewrites Host, sends to upstream, relays101,
+/// then pipes bidirectionally.
+async fn proxy_ws_upgrade_buf(client_tcp: &mut tokio::net::TcpStream, upstream_addr: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Read the raw HTTP request from the client.
+    // Read the full request from the client TCP stream.
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = match client_tcp.read(&mut tmp).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+    {
+        let mut tmp = [0u8; 4096];
+        loop {
+            match client_tcp.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.ends_with(b"\r\n\r\n") { break; }
+                }
+            }
         }
     }
-
     let req_text = String::from_utf8_lossy(&buf);
     let first_line = req_text.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -350,61 +350,57 @@ async fn proxy_ws_upgrade(
     };
     upstream_tcp.set_nodelay(true).ok();
 
-    // Rewrite the request line to use the upstream's path only, and add
-    // forwarded headers.
+    // Rewrite request line + ALL headers. Only rewrite Host.
+    let auth = upstream_addr.strip_prefix("http://")
+        .or_else(|| upstream_addr.strip_prefix("https://"))
+        .unwrap_or(upstream_addr)
+        .split(':').next().unwrap_or(upstream_addr);
     let mut rewritten = format!("{} {} HTTP/1.1\r\n", parts[0], path);
-    let authority = upstream_addr.split(':').next().unwrap_or(upstream_addr);
     for line in req_text[req_text.find("\r\n").unwrap_or(0) + 2..]
-        .lines()
-        .take_while(|l| !l.is_empty())
+        .lines().take_while(|l| !l.is_empty())
     {
         if line.to_ascii_lowercase().starts_with("host:") {
-            rewritten.push_str(&format!("Host: {authority}\r\n"));
+            rewritten.push_str(&format!("Host: {auth}\r\n"));
         } else {
             rewritten.push_str(&format!("{line}\r\n"));
         }
     }
     rewritten.push_str("\r\n");
+    eprintln!("[ws] sending to upstream:\n{}", rewritten);
 
     if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
-        log::error!("[ws] upstream write failed: {e}");
+        eprintln!("[ws] upstream write failed: {e}");
         return;
     }
 
-    // Read the101 response from upstream.
+    // Read101 from upstream.
     let mut resp_buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     loop {
-        let n = match upstream_tcp.read(&mut tmp).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        resp_buf.extend_from_slice(&tmp[..n]);
-        if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        match upstream_tcp.read(&mut tmp).await {
+            Ok(0) | Err(_) => {
+                log::error!("[ws] upstream EOF before101");
+                return;
+            }
+            Ok(n) => resp_buf.extend_from_slice(&tmp[..n]),
         }
+        if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
     }
+    let resp_preview = String::from_utf8_lossy(&resp_buf);
+    log::info!("[ws] upstream responded: {}", resp_preview.lines().next().unwrap_or(""));
+    if !resp_buf.starts_with(b"HTTP/1.1 101") { return; }
 
-    let resp_text = String::from_utf8_lossy(&resp_buf);
-    if !resp_text.starts_with("HTTP/1.1 101") {
-        log::warn!("[ws] upstream did not send 101: {}", resp_text.lines().next().unwrap_or(""));
-        let _ = client_tcp.write_all(resp_buf.as_slice()).await;
-        return;
-    }
-
-    // Forward the101 response to the client.
+    // Send101 to client and start bidirectional copy.
     if let Err(e) = client_tcp.write_all(&resp_buf).await {
         log::error!("[ws] client write101 failed: {e}");
         return;
     }
-
-    // Bidirectional raw byte copy.
-    let (mut upstream_read, mut upstream_write) = upstream_tcp.into_split();
-    let (mut client_read, mut client_write) = client_tcp.into_split();
-
-    let c2u = tokio::io::copy(&mut client_read, &mut upstream_write);
-    let u2c = tokio::io::copy(&mut upstream_read, &mut client_write);
+    let (mut client_read, mut client_write) = tokio::io::split(&mut *client_tcp);
+    let (mut ur, mut uw) = upstream_tcp.into_split();
+    let c2u = tokio::io::copy(&mut client_read, &mut uw);
+    let u2c = tokio::io::copy(&mut ur, &mut client_write);
     let _ = tokio::join!(c2u, u2c);
+    log::info!("[ws] bidirectional copy ended");
 }
 
 // Main handler
@@ -627,7 +623,7 @@ async fn main_inner() {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
                 loop {
-                    let (tcp, peer) = match http_listener.accept().await {
+                    let (mut tcp, peer) = match http_listener.accept().await {
                         Ok(c) => c,
                         Err(e) => {
                             log::error!("accept(http): {e}");
@@ -644,9 +640,12 @@ async fn main_inner() {
                         let peek_len = tcp.peek(&mut peek_buf).await.unwrap_or(0);
                         let lower = String::from_utf8_lossy(&peek_buf[..peek_len]).to_ascii_lowercase();
                         let is_ws = lower.contains("upgrade: websocket");
+                        log::info!("[http-ws] peek {} bytes, is_ws={}, first 80: {:?}",
+                            peek_len, is_ws,
+                            String::from_utf8_lossy(&peek_buf[..peek_len.min(80)]));
 
                         if is_ws {
-                            // Extract Host header to resolve the upstream.
+                            // Extract Host header from peek buffer to resolve upstream.
                             let host = String::from_utf8_lossy(&peek_buf[..peek_len])
                                 .lines()
                                 .find(|l| l.to_ascii_lowercase().starts_with("host:"))
@@ -657,8 +656,8 @@ async fn main_inner() {
                                 .map(|s| s.upstream.clone());
                             match upstream {
                                 Some(u) => {
-                                    ng_log::ws_log(&host, &u, "/ws");
-                                    proxy_ws_upgrade(tcp, &u).await;
+                                    log::info!("[ws] {} /ws -> {}", host, u);
+                                    proxy_ws_upgrade_buf(&mut tcp, &u).await;
                                 }
                                 None => {
                                     log::warn!("[ws] no upstream for host {host}");
@@ -764,7 +763,7 @@ async fn main_inner() {
                 }
             }
 
-            let tls = match start_handshake.into_stream(default_rustls_config).await {
+            let mut tls = match start_handshake.into_stream(default_rustls_config).await {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("tls handshake: {e}");
@@ -772,52 +771,34 @@ async fn main_inner() {
                 }
             };
 
-            // Read exactly one HTTP request's headers to detect WebSocket
-            // upgrade. We must NOT read beyond \r\n\r\n — the TLS stream
-            // may contain pipelined requests that hyper needs to see.
-            let mut buf_reader = tokio::io::BufReader::new(tls);
-            let mut header_bytes = Vec::new();
-            let mut one_byte = [0u8; 1];
-            loop {
-                match buf_reader.read(&mut one_byte).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        header_bytes.push(one_byte[0]);
-                        if header_bytes.ends_with(b"\r\n\r\n") {
-                            break;
+            // Read request headers byte-by-byte from the TLS stream to detect
+            // WebSocket upgrade. Reads directly from the TLS stream (no BufReader)
+            // so the stream position is correct for both WS (raw TCP) and non-WS
+            // (PrefixedReader replay for hyper).
+            let mut header_bytes = Vec::with_capacity(1024);
+            {
+                let mut one_byte = [0u8; 1];
+                loop {
+                    match tls.read(&mut one_byte).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            header_bytes.push(one_byte[0]);
+                            if header_bytes.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
                         }
                     }
                 }
             }
-            let hdr_preview = String::from_utf8_lossy(&header_bytes);
-            let is_ws = hdr_preview.to_ascii_lowercase().contains("upgrade: websocket");
-            eprintln!("[tls-ws] hdr {} bytes, is_ws={}, preview: {:?}",
-                header_bytes.len(), is_ws,
-                &hdr_preview[..hdr_preview.len().min(80)]);
-            // Recover the TLS stream from BufReader. BufReader may have read
-            // ahead into its internal buffer — those bytes are NOT in the TLS
-            // stream anymore. We must preserve them or they're lost.
-            let remaining: Vec<u8> = {
-                let buf = buf_reader.buffer();
-                let mut out = vec![0u8; buf.len()];
-                out.copy_from_slice(buf);
-                out
-            };
-            let tls = buf_reader.into_inner();
-            // Combine header_bytes + any leftover buffered bytes into one prefix
-            // so both the WS path and non-WS path see the full request.
-            // Note: header_bytes already includes the \r\n\r\n terminator from
-            // read_until, and remaining starts AFTER it, so no double-terminator.
-            let hdr_for_ws = header_bytes.clone();
-            header_bytes.extend_from_slice(&remaining);
-            let tls = PrefixedReader {
-                prefix: std::io::Cursor::new(header_bytes),
-                inner: tls,
-            };
+            let is_ws = String::from_utf8_lossy(&header_bytes)
+                .to_ascii_lowercase()
+                .contains("upgrade: websocket");
 
             if is_ws {
-                // Resolve the upstream from the Host header in the request.
-                let host = String::from_utf8_lossy(&hdr_for_ws)
+                // WS: use raw TLS stream directly for bidirectional copy.
+                // No PrefixedReader — it breaks Arc Mutex in tokio::io::split.
+                // header_bytes has consumed the request; tls is past them.
+                let host = String::from_utf8_lossy(&header_bytes)
                     .lines()
                     .find(|l| l.to_ascii_lowercase().starts_with("host:"))
                     .and_then(|l| l.split_once(':').map(|x| x.1))
@@ -850,7 +831,7 @@ async fn main_inner() {
                     upstream_tcp.set_nodelay(true).ok();
 
                     // Forward ALL headers to upstream. Only rewrite Host.
-                    let hdr_text = String::from_utf8_lossy(&hdr_for_ws);
+                    let hdr_text = String::from_utf8_lossy(&header_bytes);
                     let first_line = hdr_text.lines().next().unwrap_or("");
                     let fl_parts: Vec<&str> = first_line.split_whitespace().collect();
                     let ws_path = if fl_parts.len() >= 2 { fl_parts[1] } else { "/" };
@@ -866,7 +847,7 @@ async fn main_inner() {
                         }
                     }
                     rewritten.push_str("\r\n");
-                    log::debug!("[ws-tls] sending to upstream:\n{}", rewritten.replace('\r', ""));
+                    log::info!("[ws] rewritten request:\n{}", rewritten.replace('\r', ""));
 
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     if let Err(e) = upstream_tcp.write_all(rewritten.as_bytes()).await {
@@ -904,10 +885,14 @@ async fn main_inner() {
                 return;
             }
 
-            // Non-upgrade: tls is already a PrefixedReader with headers
-            // + remaining bytes. Hyper reads headers from the prefix, then
-            // body from the TLS stream — no data loss.
-            let io = TokioIo::new(tls);
+            // Non-upgrade: wrap the TLS stream in PrefixedReader to replay
+            // the consumed headers back to hyper. The TLS stream position
+            // is past the headers, so hyper would miss them without this.
+            let prefixed = PrefixedReader {
+                prefix: std::io::Cursor::new(header_bytes),
+                inner: tls,
+            };
+            let io = TokioIo::new(prefixed);
             let conn = http1::Builder::new().serve_connection(
                 io,
                 service_fn(move |req| handle(req, Arc::clone(&client), peer_ip)),
