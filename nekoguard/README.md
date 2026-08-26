@@ -2,7 +2,22 @@
 
 # NekoGuard
 
-A reverse proxy in Rust that protects backend services from automated bot traffic by forcing clients to solve a Proof-of-Work challenge before access is granted. Replaces nginx as the TLS edge — auto-manages certificates, routes by domain, and blocks bots, all in one binary.
+A reverse proxy in Rust that protects backend services from automated bot traffic by forcing clients to solve a Proof-of-Work challenge before access is granted. Replaces nginx as the TLS edge — routes by domain, and blocks bots.
+
+---
+
+## Workspace
+
+```
+nekoguard/           # Reverse proxy binary (this crate)
+certd/               # Certificate daemon (separate binary)
+```
+
+Build both: `cargo build --workspace`
+Build one: `cargo build -p nekoguard` or `cargo build -p nekoguard-certd`
+
+> [!TIP]
+> `nekoguard-certd` handles all ACME certificate issuance/renewal and stores certs in Redis. NekoGuard reads certs from Redis on startup — no ACME code in the proxy itself.
 
 ---
 
@@ -11,7 +26,6 @@ A reverse proxy in Rust that protects backend services from automated bot traffi
 | Feature                     | Description                                                             |
 | --------------------------- | ----------------------------------------------------------------------- |
 | 🔒 **Proof-of-Work**        | Clients solve a SHA-256 challenge before access is granted              |
-| 🌐 **Auto TLS**             | Let's Encrypt certificates via TLS-ALPN-01, auto-renewed                |
 | 🍪 **Signed Sessions**      | HMAC-SHA256 signed cookies with IP binding (no replayable tokens)       |
 | ⚡ **Rate Limiting**        | Per-IP token bucket with configurable rps/rpm/burst, per-site overrides |
 | 📊 **Redis State**          | Signing secret and rate limits stored in Redis — works across replicas  |
@@ -281,6 +295,38 @@ After solving PoW, each IP gets a **token bucket** with configured capacity. Tok
 | `burst`   | 20      | Burst capacity above rps |
 
 When exceeded: `429 Too Many Requests`
+
+---
+
+## Certificate Daemon (certd)
+
+`nekoguard-certd` is a standalone service that handles all ACME certificate operations. Run it once — NekoGuard instances read certs from Redis.
+
+```toml
+# certd.toml
+domains = ["root-workspace.net", "immich.root-workspace.net"]
+contacts = ["you@example.com"]
+cache_dir = "./acme-cache"
+staging = false
+port = 8443
+redis_url = "redis://127.0.0.1:6379"
+```
+
+```bash
+# Run certd
+NG_CERTD_CONFIG=certd.toml ./nekoguard-certd
+```
+
+**API endpoints:**
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/certs` | GET | List all certs |
+| `/certs/<domain>` | GET | Get cert for domain |
+| `/issue` | POST | Force certificate issuance |
+
+> [!IMPORTANT]
+> certd handles issuance, renewal, and challenge validation. NekoGuard just reads certs from Redis on startup. No ACME code lives in the proxy binary.
 
 ---
 

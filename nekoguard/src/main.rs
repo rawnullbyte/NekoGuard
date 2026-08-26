@@ -767,9 +767,21 @@ async fn main_inner() {
         }
     }
 
-    // Try to acquire the ACME lock. If we get it, we initiate the order.
-    // If not, we wait for the cert to appear in Redis.
-    let lock_held = acme_sync.acquire_lock().await;
+    // After syncing, re-check Redis — another replica may have uploaded
+    // a cert during our sync window. Only lock if Redis is still empty.
+    let all_certs_present = futures::future::join_all(
+        CONFIG.sites.iter().map(|s| acme_sync.load_cert(&s.domain))
+    )
+    .await
+    .into_iter()
+    .all(|c| c.is_some());
+
+    let lock_held = if all_certs_present {
+        log::info!("[acme] all certs found in Redis — no lock needed");
+        false
+    } else {
+        acme_sync.acquire_lock().await
+    };
     if lock_held {
         log::info!("[acme] acquired lock — will initiate ACME order");
     } else {

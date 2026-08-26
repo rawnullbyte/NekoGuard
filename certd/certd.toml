@@ -1,0 +1,20 @@
+# nekoguard-certd configuration
+# Handles ACME certificate issuance for all NekoGuard instances.
+
+# Domains to manage certificates for
+domains = ["root-workspace.net", "immich.root-workspace.net"]
+
+# ACME account contacts
+contacts = ["you@example.com"]
+
+# Certificate cache directory
+cache_dir = "./acme-cache"
+
+# Use LE staging while testing
+staging = false
+
+# Listen port for NekoGuard to query
+port = 8443
+
+# Redis connection
+redis_url = "redis://127.0.0.1:6379"
