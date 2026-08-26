@@ -727,17 +727,43 @@ async fn main_inner() {
     // ACME cert sync via Redis
     let acme_sync = Arc::new(acme_sync::AcmeSync::new(Arc::clone(&redis_conn)));
 
-    // On startup: check Redis for existing certs, write to DirCache
+    // On startup: sync certs between Redis and DirCache
+    // 1. Redis → DirCache: other replicas' certs
+    // 2. DirCache → Redis: this replica's local certs (if Redis was cleared)
+    let cache_dir = std::path::Path::new(&CONFIG.cache_dir);
+    let _ = std::fs::create_dir_all(cache_dir);
+
     for site in &CONFIG.sites {
-        if let Some(cert) = acme_sync.load_cert(&site.domain).await {
-            log::info!("[acme] loaded cert from Redis for {}", site.domain);
-            // Write cert/key to DirCache so rustls-acme finds it
-            let cache_dir = std::path::Path::new(&CONFIG.cache_dir);
-            let _ = std::fs::create_dir_all(cache_dir);
-            let cert_path = cache_dir.join(format!("{}.crt", site.domain));
-            let key_path = cache_dir.join(format!("{}.key", site.domain));
-            let _ = std::fs::write(&cert_path, &cert.cert_pem);
-            let _ = std::fs::write(&key_path, &cert.key_pem);
+        let cert_path = cache_dir.join(format!("{}.crt", site.domain));
+        let key_path = cache_dir.join(format!("{}.key", site.domain));
+
+        let redis_cert = acme_sync.load_cert(&site.domain).await;
+        let local_cert = if cert_path.exists() && key_path.exists() {
+            Some(acme_sync::CertData {
+                cert_pem: std::fs::read_to_string(&cert_path).unwrap_or_default(),
+                key_pem: std::fs::read_to_string(&key_path).unwrap_or_default(),
+                issued_at: 0,
+                expires_at: 0,
+            })
+        } else {
+            None
+        };
+
+        match (redis_cert, local_cert) {
+            (Some(rc), _) => {
+                // Redis has cert → write to DirCache
+                let _ = std::fs::write(&cert_path, &rc.cert_pem);
+                let _ = std::fs::write(&key_path, &rc.key_pem);
+                log::debug!("[acme] synced cert from Redis → DirCache: {}", site.domain);
+            }
+            (None, Some(lc)) => {
+                // Local has cert but Redis doesn't → write to Redis
+                acme_sync.store_cert(&site.domain, &lc).await;
+                log::debug!("[acme] synced cert from DirCache → Redis: {}", site.domain);
+            }
+            (None, None) => {
+                log::debug!("[acme] no cert yet for {}", site.domain);
+            }
         }
     }
 
