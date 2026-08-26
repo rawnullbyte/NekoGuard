@@ -1,3 +1,4 @@
+mod acme_sync;
 mod config;
 mod ng_log;
 mod pow;
@@ -723,25 +724,91 @@ async fn main_inner() {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await.unwrap();
 
-    // Build the ACME state for the fixed domain list. tokio_incoming would hide
-    // the peer address, so we drive the low-level state ourselves and keep the
-    // TCP peer IP for the allowlist fallback.
+    // ACME cert sync via Redis
+    let acme_sync = Arc::new(acme_sync::AcmeSync::new(Arc::clone(&redis_conn)));
+
+    // On startup: check Redis for existing certs, write to DirCache
+    for site in &CONFIG.sites {
+        if let Some(cert) = acme_sync.load_cert(&site.domain).await {
+            log::info!("[acme] loaded cert from Redis for {}", site.domain);
+            // Write cert/key to DirCache so rustls-acme finds it
+            let cache_dir = std::path::Path::new(&CONFIG.cache_dir);
+            let _ = std::fs::create_dir_all(cache_dir);
+            let cert_path = cache_dir.join(format!("{}.crt", site.domain));
+            let key_path = cache_dir.join(format!("{}.key", site.domain));
+            let _ = std::fs::write(&cert_path, &cert.cert_pem);
+            let _ = std::fs::write(&key_path, &cert.key_pem);
+        }
+    }
+
+    // Try to acquire the ACME lock. If we get it, we initiate the order.
+    // If not, we wait for the cert to appear in Redis.
+    let lock_held = acme_sync.acquire_lock().await;
+    if lock_held {
+        log::info!("[acme] acquired lock — will initiate ACME order");
+    } else {
+        log::info!("[acme] another replica holds the lock — waiting for cert");
+        // Wait for all domains to have certs
+        for site in &CONFIG.sites {
+            if acme_sync.load_cert(&site.domain).await.is_none() {
+                log::info!("[acme] waiting for cert: {}", site.domain);
+                if let Some(cert) = acme_sync.wait_for_cert(&site.domain).await {
+                    // Write to DirCache
+                    let cache_dir = std::path::Path::new(&CONFIG.cache_dir);
+                    let _ = std::fs::create_dir_all(cache_dir);
+                    let cert_path = cache_dir.join(format!("{}.crt", site.domain));
+                    let key_path = cache_dir.join(format!("{}.key", site.domain));
+                    let _ = std::fs::write(&cert_path, &cert.cert_pem);
+                    let _ = std::fs::write(&key_path, &cert.key_pem);
+                    log::info!("[acme] cert received for {}", site.domain);
+                } else {
+                    log::warn!("[acme] timed out waiting for cert: {}", site.domain);
+                }
+            }
+        }
+    }
+
+    // Build the ACME state. DirCache now has any certs from Redis.
     let mut acme_state = AcmeConfig::new(CONFIG.sites.iter().map(|s| s.domain.clone()))
         .contact(CONFIG.acme_contacts())
         .cache(DirCache::new(CONFIG.cache_dir.clone()))
         .directory_lets_encrypt(!CONFIG.staging)
         .state();
 
-    // challenge config answers TLS-ALPN-01 validation; default config serves the
-    // real certificates for normal traffic.
     let challenge_rustls_config = acme_state.challenge_rustls_config();
     let default_rustls_config = acme_state.default_rustls_config();
 
     // Drive the ACME event loop (issuance + renewal) in the background.
+    let acme_sync_ev = Arc::clone(&acme_sync);
     tokio::spawn(async move {
         loop {
             match acme_state.next().await {
-                Some(Ok(ok)) => log::info!("acme: {ok:?}"),
+                Some(Ok(ok)) => {
+                    log::info!("acme: {ok:?}");
+                    // After successful issuance/renewal, store cert in Redis
+                    for site in &CONFIG.sites {
+                        let cache_dir = std::path::Path::new(&CONFIG.cache_dir);
+                        let cert_path = cache_dir.join(format!("{}.crt", site.domain));
+                        let key_path = cache_dir.join(format!("{}.key", site.domain));
+                        if cert_path.exists() && key_path.exists() {
+                            if let (Ok(cert_pem), Ok(key_pem)) = (
+                                std::fs::read_to_string(&cert_path),
+                                std::fs::read_to_string(&key_path),
+                            ) {
+                                let cert = acme_sync::CertData {
+                                    cert_pem,
+                                    key_pem,
+                                    issued_at: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    expires_at: 0, // rustls-acme handles expiry
+                                };
+                                acme_sync_ev.store_cert(&site.domain, &cert).await;
+                            }
+                        }
+                    }
+                }
                 Some(Err(err)) => log::error!("acme error: {err:?}"),
                 None => break,
             }

@@ -8,16 +8,16 @@ A reverse proxy in Rust that protects backend services from automated bot traffi
 
 ## Features
 
-| Feature | Description |
-|---------|-------------|
-| 🔒 **Proof-of-Work** | Clients solve a SHA-256 challenge before access is granted |
-| 🌐 **Auto TLS** | Let's Encrypt certificates via TLS-ALPN-01, auto-renewed |
-| 🍪 **Signed Sessions** | HMAC-SHA256 signed cookies with IP binding (no replayable tokens) |
-| ⚡ **Rate Limiting** | Per-IP token bucket with configurable rps/rpm/burst, per-site overrides |
-| 📊 **Redis State** | Signing secret and rate limits stored in Redis — works across replicas |
-| 🛡️ **SNI Allowlist** | Unknown domains are refused at the TLS handshake level |
-| 🔄 **WebSocket Proxy** | Full WS proxying through the TLS edge with bidirectional piping |
-| 📝 **Configurable Logging** | File output, request logging with timing, configurable levels |
+| Feature                     | Description                                                             |
+| --------------------------- | ----------------------------------------------------------------------- |
+| 🔒 **Proof-of-Work**        | Clients solve a SHA-256 challenge before access is granted              |
+| 🌐 **Auto TLS**             | Let's Encrypt certificates via TLS-ALPN-01, auto-renewed                |
+| 🍪 **Signed Sessions**      | HMAC-SHA256 signed cookies with IP binding (no replayable tokens)       |
+| ⚡ **Rate Limiting**        | Per-IP token bucket with configurable rps/rpm/burst, per-site overrides |
+| 📊 **Redis State**          | Signing secret and rate limits stored in Redis — works across replicas  |
+| 🛡️ **SNI Allowlist**        | Unknown domains are refused at the TLS handshake level                  |
+| 🔄 **WebSocket Proxy**      | Full WS proxying through the TLS edge with bidirectional piping         |
+| 📝 **Configurable Logging** | File output, request logging with timing, configurable levels           |
 
 ---
 
@@ -32,11 +32,9 @@ flowchart TB
     NG --- Redis[(Redis)]
     NG2 --- Redis
     NG3 --- Redis
-    NG --> S1[Service 1]
-    NG --> S2[Service 2]
-    NG2 --> S1
-    NG2 --> S2
-    NG3 --> S3[Service 3]
+    NG --> Services
+    NG2 --> Services
+    NG3 --> Services
 ```
 
 > [!IMPORTANT]
@@ -166,19 +164,19 @@ burst = 30
 
 ### Environment Variables
 
-| Variable | Description |
-|----------|-------------|
+| Variable    | Description                                              |
+| ----------- | -------------------------------------------------------- |
 | `NG_CONFIG` | Path to the TOML config file (default: `nekoguard.toml`) |
 
 ### Defaults
 
-| Setting | Value |
-|---------|-------|
-| TLS port | 443 (+ :80 for http→https redirects) |
-| PoW difficulty | 14 bits (~16k hash attempts) |
-| Challenge TTL | 5 minutes |
-| Session TTL | 30 minutes |
-| Rate limit | Disabled by default |
+| Setting        | Value                                |
+| -------------- | ------------------------------------ |
+| TLS port       | 443 (+ :80 for http→https redirects) |
+| PoW difficulty | 14 bits (~16k hash attempts)         |
+| Challenge TTL  | 5 minutes                            |
+| Session TTL    | 30 minutes                           |
+| Rate limit     | Disabled by default                  |
 
 ---
 
@@ -207,8 +205,8 @@ flowchart LR
     LB -->|SNI: other.com| R2[NekoGuard 2]
     R1 --- Redis[(Redis)]
     R2 --- Redis
-    R1 --> S1[Service 1]
-    R1 --> S2[Service 2]
+    R1 --> S1[example.com server]
+    R2 --> S2[other.com server]
 ```
 
 > [!TIP]
@@ -252,6 +250,7 @@ NG_REDIS_URL=redis://127.0.0.1:6379
 ```
 
 **What Redis stores:**
+
 - `nekoguard:secret` — HMAC signing secret (shared across all replicas)
 - Rate limit state (currently in-memory; will move to Redis for multi-replica support)
 
@@ -274,12 +273,12 @@ Certificates are obtained via **TLS-ALPN-01** — NekoGuard answers ACME validat
 
 After solving PoW, each IP gets a **token bucket** with configured capacity. Tokens refill at `rps` rate. If `rpm` is set, it acts as a per-minute ceiling.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `enabled` | false | Enable rate limiting |
-| `rps` | 10 | Max requests per second |
-| `rpm` | 600 | Max requests per minute |
-| `burst` | 20 | Burst capacity above rps |
+| Parameter | Default | Description              |
+| --------- | ------- | ------------------------ |
+| `enabled` | false   | Enable rate limiting     |
+| `rps`     | 10      | Max requests per second  |
+| `rpm`     | 600     | Max requests per minute  |
+| `burst`   | 20      | Burst capacity above rps |
 
 When exceeded: `429 Too Many Requests`
 
@@ -300,19 +299,3 @@ nekoguard_session=<ip>.<expiry_hex>.<nonce_hex>.<hmac_hex>
 
 > [!CAUTION]
 > The signing secret is generated once and stored in Redis. Deleting the `nekoguard:secret` key invalidates all sessions — all users must re-solve PoW.
-
----
-
-## Project Structure
-
-```
-src/
-├── main.rs          # TLS edge, request handler, proxy logic
-├── config.rs        # TOML config parsing, site expansion
-├── session.rs       # HMAC-signed session cookies, Redis secret
-├── ratelimit.rs     # Token bucket rate limiting
-├── pow.rs           # SHA-256 PoW: challenge gen, verify, sweep
-├── ng_log.rs        # Custom logger with file output
-├── challenge.html   # Client-side PoW page (minified at build)
-└── assets/          # Embedded static assets
-```
