@@ -37,6 +37,7 @@ impl BytesBody for BufferedBody {
     async fn into_bytes(
         &mut self,
     ) -> Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        log::info!("[buffered-body] into_bytes called, {}B ready", self.0.len());
         Ok(std::mem::take(&mut self.0))
     }
 }
