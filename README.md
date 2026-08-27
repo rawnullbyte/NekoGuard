@@ -76,45 +76,46 @@ flowchart TB
 
 ```toml
 # ── Shared (both certd and nekoguard) ─────────────────────────────
-domains = ["root-workspace.net", "immich.root-workspace.net"]
-redis_url = "redis://127.0.0.1:6379"
-contact_email = "you@example.com"
-cloudflare_api_token = "your-cloudflare-api-token"
-cloudflare_zone_id = "your-zone-id"
+[redis]
+url = "redis://127.0.0.1:6379"
 
-# ── NekoGuard ─────────────────────────────────────────────────────
-[nekoguard]
-port = 443
-whitelist = ["127.0.0.1"]
-
-[nekoguard.session]
-cookie_name = "nekoguard_session"
-ttl = 1800
-
-[nekoguard.rate_limit]
+[rate_limit]
 enabled = true
 rps = 10
 rpm = 600
 burst = 20
 
-[nekoguard.log]
+[log]
 level = "info"
 file = "/var/log/nekoguard.log"
 requests = true
 
-# ── Sites (NekoGuard) ────────────────────────────────────────────
-[[nekoguard.sites]]
+# ── Sites (both binaries read these) ─────────────────────────────
+[[sites]]
 domain = "root-workspace.net"
 upstream = "http://10.1.3.16:2283"
+bypass = ["^/api/.*"]
 
-  [[nekoguard.sites.sub]]
+  [[sites.sub]]
   name = "immich"
   upstream = "http://10.1.3.16:2283"
 
-# ── Certd ────────────────────────────────────────────────────────
+# ── NekoGuard-specific ────────────────────────────────────────────
+[nekoguard]
+port = 443
+whitelist = ["127.0.0.1"]
+catchall = { upstream = "http://10.0.0.5:2368", bypass = [".*"] }
+
+[nekoguard.session]
+ttl = 1800
+
+# ── Certd-specific ────────────────────────────────────────────────
 [certd]
 port = 8443
 renewal_interval = 86400
+contact_email = "you@example.com"
+cloudflare_api_token = "your-cloudflare-api-token"
+cloudflare_zone_id = "your-zone-id"
 ```
 
 ### Path Bypass

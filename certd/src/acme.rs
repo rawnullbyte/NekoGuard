@@ -19,13 +19,13 @@ pub struct CertData {
 }
 
 /// Run the ACME loop: issue/renew certs for all domains, store in Redis.
-pub async fn run_acme_loop(redis_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let cache_dir = std::env::temp_dir().join("nekoguard-certd");
     std::fs::create_dir_all(&cache_dir).ok();
 
     let cf_client = CloudflareDns::new(
-        &CONFIG.cloudflare_api_token,
-        &CONFIG.cloudflare_zone_id,
+        &CONFIG.certd.cloudflare_api_token,
+        &CONFIG.certd.cloudflare_zone_id,
     );
 
     // Create or load ACME account
@@ -45,7 +45,7 @@ pub async fn run_acme_loop(redis_url: &str) -> Result<(), Box<dyn std::error::Er
         let (account, credentials) = Account::builder()?
             .create(
                 &NewAccount {
-                    contact: &[&CONFIG.contact_email],
+                    contact: &[&CONFIG.certd.contact_email],
                     terms_of_service_agreed: true,
                     only_return_existing: false,
                 },
@@ -60,7 +60,7 @@ pub async fn run_acme_loop(redis_url: &str) -> Result<(), Box<dyn std::error::Er
     };
 
     // Initial issuance
-    for domain in &CONFIG.domains {
+    for domain in domains {
         issue_or_renew(&account, &cf_client, redis_url, domain).await;
     }
 
@@ -73,7 +73,7 @@ pub async fn run_acme_loop(redis_url: &str) -> Result<(), Box<dyn std::error::Er
             .get_connection_manager()
             .await
             .expect("redis conn manager");
-        for domain in &CONFIG.domains {
+        for domain in domains {
             if let Some(cert) = load_cert(&mut redis, domain).await {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -249,9 +249,10 @@ pub async fn load_cert(
 
 pub async fn get_all_certs(
     redis: &mut redis::aio::ConnectionManager,
+    domains: &[String],
 ) -> Vec<(String, CertData)> {
     let mut result = Vec::new();
-    for domain in &CONFIG.domains {
+    for domain in domains {
         if let Some(cert) = load_cert(redis, domain).await {
             result.push((domain.clone(), cert));
         }

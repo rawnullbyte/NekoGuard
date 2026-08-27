@@ -675,7 +675,7 @@ async fn main_inner() {
     let client = Arc::new(client);
 
     // Initialize Redis + session manager
-    let redis_client = redis::Client::open(CONFIG.redis_url.as_str())
+    let redis_client = redis::Client::open(CONFIG.redis.url.as_str())
         .expect("failed to connect to Redis");
     let sess = Arc::new(
         session::SessionManager::new_with_config(
@@ -698,7 +698,7 @@ async fn main_inner() {
 
     // Subscribe to Redis Pub/Sub for cert updates from certd
     let tls_reload = tls_config.clone();
-    let redis_url_subscribe = CONFIG.redis_url.clone();
+    let redis_url_subscribe = CONFIG.redis.url.clone();
     tokio::spawn(async move {
         loop {
             match redis::Client::open(redis_url_subscribe.as_str()) {

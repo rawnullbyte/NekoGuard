@@ -6,34 +6,42 @@ const DEFAULT_CONFIG_PATH: &str = "nekoguard.toml";
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Shared fields (from root of nekoguard.toml)
-    #[serde(default)]
-    pub domains: Vec<String>,
-    #[serde(default = "default_redis_url")]
-    pub redis_url: String,
-    #[serde(default = "default_contact_email")]
-    pub contact_email: String,
-    #[serde(default)]
-    pub cloudflare_api_token: String,
-    #[serde(default)]
-    pub cloudflare_zone_id: String,
+    pub sites: Vec<SiteToml>,
 
-    /// Certd-specific fields (from [certd] section)
+    #[serde(default)]
+    pub redis: RedisConfig,
+
     #[serde(default, rename = "certd")]
     pub certd: CertdConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RedisConfig {
+    #[serde(default = "default_redis_url")]
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SiteToml {
+    pub domain: String,
+    pub upstream: String,
+    #[serde(default)]
+    bypass: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct CertdConfig {
     #[serde(default = "default_port")]
     pub port: u16,
+    pub contact_email: String,
+    pub cloudflare_api_token: String,
+    pub cloudflare_zone_id: String,
     #[serde(default = "default_renewal_interval")]
     pub renewal_interval: u64,
 }
 
 fn default_port() -> u16 { 8443 }
 fn default_redis_url() -> String { "redis://127.0.0.1:6379".to_string() }
-fn default_contact_email() -> String { "you@example.com".to_string() }
 fn default_renewal_interval() -> u64 { 86400 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {

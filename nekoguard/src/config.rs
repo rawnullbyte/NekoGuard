@@ -156,36 +156,49 @@ impl Default for RateLimitConfig {
 struct ConfigToml {
     #[serde(default)]
     sites: Vec<SiteToml>,
-    #[serde(default = "default_port")]
-    port: u16,
 
-    /// Optional plain-HTTP listener for local testing without TLS.
     #[serde(default)]
-    port_http: Option<u16>,
+    redis: RedisConfig,
 
-    /// Logging configuration.
-    #[serde(default)]
-    log: LogConfig,
-
-    /// Session cookie configuration.
-    #[serde(default)]
-    session: SessionConfig,
-
-    /// Global rate limit defaults. Per-site overrides merge on top.
     #[serde(default)]
     rate_limit: RateLimitConfig,
 
-    /// Redis connection URL.
-    #[serde(default = "default_redis_url")]
-    redis_url: String,
+    #[serde(default)]
+    log: LogConfig,
 
-    /// Permanent IP whitelist — these IPs bypass PoW entirely.
     #[serde(default)]
     whitelist: Vec<String>,
 
-    /// Catch-all for unknown SNI. If set, unmatched domains are proxied here.
     #[serde(default)]
     catchall: Option<CatchallConfig>,
+
+    #[serde(default)]
+    nekoguard: NekoguardSub,
+
+    #[serde(default)]
+    certd: CertdSub,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct NekoguardSub {
+    #[serde(default = "default_port")]
+    port: u16,
+    #[serde(default)]
+    port_http: Option<u16>,
+    #[serde(default)]
+    whitelist: Vec<String>,
+    #[serde(default)]
+    session: SessionConfig,
+    #[serde(default)]
+    catchall: Option<CatchallConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct CertdSub {
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    renewal_interval: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -202,15 +215,15 @@ pub struct CatchallConfig {
 #[derive(Debug)]
 pub struct Config {
     pub sites: Vec<Site>,
-    pub port: u16,
-    pub port_http: Option<u16>,
-    pub log: LogConfig,
-    pub session: SessionConfig,
     pub rate_limit: RateLimitConfig,
-    pub redis_url: String,
+    pub log: LogConfig,
     pub whitelist: Vec<IpAddr>,
     pub catchall: Option<CatchallConfig>,
     pub catchall_bypass: Vec<regex::Regex>,
+    pub port: u16,
+    pub port_http: Option<u16>,
+    pub session: SessionConfig,
+    pub redis: RedisConfig,
 }
 
 fn default_port() -> u16 {
@@ -219,6 +232,12 @@ fn default_port() -> u16 {
 
 fn default_redis_url() -> String {
     "redis://127.0.0.1:6379".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RedisConfig {
+    #[serde(default = "default_redis_url")]
+    pub url: String,
 }
 
 /// Lowercase, strip any :port suffix and trailing dot so Host/SNI values
@@ -327,12 +346,8 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
 
     Config {
         sites,
-        port: raw.port,
-        port_http: raw.port_http,
-        log: raw.log,
-        session: raw.session,
         rate_limit: global_rl,
-        redis_url: raw.redis_url,
+        log: raw.log,
         whitelist,
         catchall: raw.catchall.clone(),
         catchall_bypass: raw.catchall.as_ref().map(|c| {
@@ -340,6 +355,10 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
                 regex::Regex::new(p).unwrap_or_else(|e| panic!("bad catchall bypass '{p}': {e}"))
             }).collect()
         }).unwrap_or_default(),
+        port: raw.nekoguard.port,
+        port_http: raw.nekoguard.port_http,
+        session: raw.nekoguard.session,
+        redis: raw.redis,
     }
 }
 

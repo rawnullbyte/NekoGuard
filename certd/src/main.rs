@@ -30,19 +30,20 @@ async fn handle(
         }
 
         (&Method::GET, "/certs") => {
-            let mut conn = redis::Client::open(CONFIG.redis_url.as_str())
+            let mut conn = redis::Client::open(CONFIG.redis.url.as_str())
                 .expect("redis connect")
                 .get_connection_manager()
                 .await
                 .expect("redis conn manager");
-            let certs = acme::get_all_certs(&mut conn).await;
+            let domains: Vec<String> = CONFIG.sites.iter().map(|s| s.domain.clone()).collect();
+            let certs = acme::get_all_certs(&mut conn, &domains).await;
             let json = serde_json::to_string(&certs).unwrap_or_else(|_| "[]".to_string());
             Ok(json_resp(StatusCode::OK, &json))
         }
 
         (&Method::GET, p) if p.starts_with("/certs/") => {
             let domain = &p[7..];
-            let mut conn = redis::Client::open(CONFIG.redis_url.as_str())
+            let mut conn = redis::Client::open(CONFIG.redis.url.as_str())
                 .expect("redis connect")
                 .get_connection_manager()
                 .await
@@ -70,9 +71,10 @@ async fn main() {
     log::info!("nekoguard-certd starting on :{}", CONFIG.certd.port);
 
     // Start ACME issuance/renewal loop in background
-    let redis_url = CONFIG.redis_url.clone();
+    let domains: Vec<String> = CONFIG.sites.iter().map(|s| s.domain.clone()).collect();
+    let redis_url = CONFIG.redis.url.clone();
     tokio::spawn(async move {
-        acme::run_acme_loop(&redis_url).await;
+        acme::run_acme_loop(&redis_url, &domains).await;
     });
 
     // HTTP server for cert queries
