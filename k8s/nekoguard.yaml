@@ -20,11 +20,6 @@ spec:
           image: docker.io/library/nekoguard:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/nekoguard"]
-          ports:
-            - containerPort: 443
-              name: https
-            - containerPort: 80
-              name: http
           env:
             - name: NG_CONFIG
               value: /etc/nekoguard/nekoguard.toml
