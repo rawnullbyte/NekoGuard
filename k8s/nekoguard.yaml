@@ -4,7 +4,7 @@ metadata:
   name: nekoguard
   namespace: nekoguard
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: nekoguard
@@ -20,8 +20,10 @@ spec:
           command: ["/usr/local/bin/nekoguard"]
           ports:
             - containerPort: 443
+              hostPort: 443
               name: https
             - containerPort: 80
+              hostPort: 80
               name: http
           env:
             - name: NG_CONFIG
@@ -60,15 +62,13 @@ metadata:
   name: nekoguard
   namespace: nekoguard
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: nekoguard
   ports:
     - port: 443
       targetPort: 443
-      nodePort: 30443
       name: https
     - port: 80
       targetPort: 80
-      nodePort: 30080
       name: http
