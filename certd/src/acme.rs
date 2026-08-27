@@ -65,9 +65,10 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
         log::info!("[certd] creating new ACME account");
         log::info!("[certd] calling Account::builder()...");
         let builder = Account::builder()?;
-        log::info!("[certd] calling builder.create()...");
-        let (account, credentials) = builder
-            .create(
+        log::info!("[certd] calling builder.create() (30s timeout)...");
+        let (account, credentials) = tokio::time::timeout(
+            Duration::from_secs(30),
+            builder.create(
                 &NewAccount {
                     contact: &[&CONFIG.certd.contact_email],
                     terms_of_service_agreed: true,
@@ -75,8 +76,12 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
                 },
                 LetsEncrypt::Production.url().to_owned(),
                 None,
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            "ACME account creation timed out after 30s".into()
+        })??;
         log::info!("[certd] ACME account created successfully");
         let creds_json = serde_json::to_string_pretty(&credentials).unwrap();
         let _ = std::fs::write(&creds_path, &creds_json);
