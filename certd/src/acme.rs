@@ -309,9 +309,9 @@ impl AcmeClient {
         // Step 4: Set DNS record via Cloudflare
         set_cloudflare_txt(domain, &txt_value).await?;
 
-        // Step 5: Wait for DNS propagation
-        log::info!("[acme] waiting 10s for DNS propagation...");
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Step 5: Wait for DNS propagation (Cloudflare can take 60s+)
+        log::info!("[acme] waiting 30s for DNS propagation...");
+        tokio::time::sleep(Duration::from_secs(30)).await;
 
         // Step 6: Respond to challenge
         log::info!("[acme] responding to challenge");
