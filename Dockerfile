@@ -5,6 +5,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY nekoguard/ nekoguard/
 COPY certd/ certd/
 
+# Diagnostic: print resolved features before building
+RUN cargo tree -p nekoguard-certd -f '{p} features={f}' | grep rustls && \
+    cargo tree -p nekoguard-certd -i aws-lc-rs 2>&1 || true
+
 RUN cargo build --release --workspace
 
 # Runtime image
