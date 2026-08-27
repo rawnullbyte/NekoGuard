@@ -1,6 +1,5 @@
 
 use crate::config::CONFIG;
-use http_body_util::BodyExt;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType,
     HttpClient, BytesResponse, BodyWrapper,
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Once;
 use tokio::time::Duration;
+use http_body_util::BodyExt;
 
 /// Ensure exactly one rustls crypto provider (ring) is installed.
 /// Called at the top of the ACME loop so it runs on the tokio worker thread.
@@ -49,10 +49,13 @@ impl HttpClient for ReqwestAcmeClient {
         let client = self.0.clone();
         Box::pin(async move {
             let (parts, mut body) = req.into_parts();
-            let body_bytes = Pin::new(&mut body).collect().await
+            log::info!("[certd-acme-http] {} {}", parts.method, parts.uri);
+
+            let body_bytes = body.collect().await
                 .map_err(|e| instant_acme::Error::Other(Box::new(e)))?
                 .to_bytes();
 
+            log::info!("[certd-acme-http] body collected, sending via reqwest...");
             let url = parts.uri.to_string();
             let method = parts.method.clone();
             let mut req_builder = match method {
