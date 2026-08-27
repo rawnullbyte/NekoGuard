@@ -200,25 +200,21 @@ NG_CONFIG=nekoguard.toml ./target/release/nekoguard
 
 ### Kubernetes
 
+> [!WARNING]
+> After any `docker build`, you **must** run `docker save nekoguard:latest | k3s ctr images import -` to push the image into k3s's containerd. Without this, k3s silently runs the old image. Use `./deploy.sh` to handle this automatically.
+
 ```bash
-# 1. Create namespace and secrets
+# 1. Build and import into k3s
+docker build --no-cache -t nekoguard:latest .
+docker save nekoguard:latest | k3s ctr images import -
+
+# 2. Apply manifests
 kubectl apply -f k8s/namespace.yaml
-kubectl edit -f k8s/secret.yaml    # fill in real Cloudflare credentials
-kubectl apply -f k8s/secret.yaml
-
-# 2. Create config (edit configmap.yaml with your domains first)
-kubectl apply -f k8s/configmap.yaml
-
-# 3. Start Redis
 kubectl apply -f k8s/redis.yaml
-
-# 4. Start certd (single replica)
 kubectl apply -f k8s/certd.yaml
-
-# 5. Wait for certd to issue certs, then start NekoGuard
 kubectl apply -f k8s/nekoguard.yaml
 
-# 6. Check status
+# 3. Check status
 kubectl get pods -n nekoguard
 kubectl logs -f deployment/nekoguard-certd -n nekoguard
 ```
@@ -409,17 +405,43 @@ docker run -p 443:443 -p 80:80 \
 
 ---
 
-## Kubernetes
+## Kubernetes (k3s)
+
+> [!CAUTION]
+> **k3s uses containerd, not Docker.** `docker build` only updates Docker's image store — k3s has its own separate image cache. If you run `docker build` and then `kubectl rollout restart`, k3s will keep running the **old cached image** and your changes won't take effect.
+
+### Deploying
+
+Use the deploy script (handles both Docker build and k3s containerd import):
 
 ```bash
-# Apply all manifests
+./deploy.sh
+```
+
+Or manually step by step:
+
+```bash
+# 1. Build the Docker image
+docker build --no-cache -t nekoguard:latest .
+
+# 2. Import into k3s containerd (THIS IS THE CRITICAL STEP)
+docker save nekoguard:latest | k3s ctr images import -
+
+# 3. Apply manifests (first time only)
 kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/secret.yaml    # Replace with real credentials
 kubectl apply -f k8s/redis.yaml
-kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/certd.yaml
 kubectl apply -f k8s/nekoguard.yaml
+
+# 4. Restart deployments to pick up the new image
+kubectl rollout restart deployment -n nekoguard
+
+# 5. Verify
+kubectl get pods -n nekoguard
 ```
+
+> [!WARNING]
+> **Never skip step 2.** Without `k3s ctr images import`, k3s will silently use the old image. You'll see pods running but your code changes won't be there.
 
 ### Architecture
 
