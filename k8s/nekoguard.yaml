@@ -15,7 +15,8 @@ spec:
     spec:
       containers:
         - name: nekoguard
-          image: nekoguard:latest
+          image: docker.io/library/nekoguard:latest
+          imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/nekoguard"]
           ports:
             - containerPort: 443
@@ -50,8 +51,8 @@ spec:
       volumes:
         - name: config
           hostPath:
-            path: /etc/nekoguard/nekoguard.toml
-            type: File
+            path: /etc/nekoguard
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

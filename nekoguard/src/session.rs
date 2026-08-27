@@ -11,12 +11,16 @@ const SECRET_LEN: usize = 32;
 /// A validated session from a signed cookie.
 #[derive(Debug, Clone)]
 pub struct Session {
+    #[allow(dead_code)]
     pub ip: IpAddr,
+    #[allow(dead_code)]
     pub expiry: Instant,
+    #[allow(dead_code)]
     pub cookie: String,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum SessionError {
     Missing,
     Malformed,
@@ -39,6 +43,7 @@ impl std::fmt::Display for SessionError {
 
 /// Manages signed session cookies using SHA-256 with HMAC-like keying.
 /// The signing secret is stored in Redis for cross-replica sharing.
+#[allow(dead_code)]
 pub struct SessionManager {
     secret: Vec<u8>,
     cookie_name: String,

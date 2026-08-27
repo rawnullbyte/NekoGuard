@@ -17,11 +17,6 @@ env_logger = "0.11"
 redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12", features = ["json"] }
 instant-acme = { version = "0.8.5", features = ["ring"] }
-rustls = "0.23.43"
+rustls = { version = "0.23.43", features = ["ring"] }
 
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
+

@@ -5,6 +5,7 @@ const CONFIG_PATH_ENV: &str = "NG_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "nekoguard.toml";
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Config {
     pub sites: Vec<SiteToml>,
 
@@ -22,6 +23,7 @@ pub struct RedisConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SiteToml {
     pub domain: String,
     pub upstream: String,
@@ -30,6 +32,7 @@ pub struct SiteToml {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[allow(dead_code)]
 pub struct CertdConfig {
     #[serde(default = "default_port")]
     pub port: u16,

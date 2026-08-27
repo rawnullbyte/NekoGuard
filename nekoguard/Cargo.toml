@@ -39,10 +39,3 @@ arc-swap = "1.9.2"
 
 [build-dependencies]
 minify-html = "0.15"
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true

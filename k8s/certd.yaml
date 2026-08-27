@@ -15,7 +15,8 @@ spec:
     spec:
       containers:
         - name: nekoguard-certd
-          image: nekoguard:latest
+          image: docker.io/library/nekoguard:latest
+          imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/nekoguard-certd"]
           env:
             - name: NG_CONFIG
@@ -35,8 +36,8 @@ spec:
       volumes:
         - name: config
           hostPath:
-            path: /etc/nekoguard/nekoguard.toml
-            type: File
+            path: /etc/nekoguard
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

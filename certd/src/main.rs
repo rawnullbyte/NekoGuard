@@ -68,6 +68,11 @@ async fn main() {
         .filter_level(log::LevelFilter::Info)
         .init();
 
+    // Install rustls crypto provider before any TLS operations
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     log::info!("nekoguard-certd starting on :{}", CONFIG.certd.port);
 
     // Start ACME issuance/renewal loop in background

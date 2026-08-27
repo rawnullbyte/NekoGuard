@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
 const CERT_PREFIX: &str = "nekoguard:cert:";
-const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertData {

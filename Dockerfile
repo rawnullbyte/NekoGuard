@@ -27,4 +27,4 @@ USER nekoguard
 EXPOSE 443 80 8443
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD ["/usr/local/bin/nekoguard-certd", "--health"] || exit 1
+    CMD curl -sf http://localhost:8443/health || exit 1
