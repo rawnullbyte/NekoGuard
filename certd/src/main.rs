@@ -69,15 +69,13 @@ async fn main() {
         .init();
 
     // Install rustls crypto provider before any TLS operations.
-    eprintln!("[certd] calling install_default...");
+    log::error!("[certd] CALLED: install_default");
     match rustls::crypto::ring::default_provider().install_default() {
         Ok(()) => {
-            eprintln!("[certd] install_default OK");
-            log::info!("[certd] rustls crypto provider installed");
+            log::error!("[certd] RESULT: install_default OK");
         }
-        Err(_) => {
-            eprintln!("[certd] install_default FAILED (provider already installed)");
-            log::warn!("[certd] rustls crypto provider: already installed");
+        Err(e) => {
+            log::error!("[certd] RESULT: install_default FAILED: {e:?}");
         }
     }
 

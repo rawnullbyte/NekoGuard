@@ -13,19 +13,17 @@ use tokio::time::Duration;
 fn ensure_crypto_provider() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        eprintln!("[certd] ensure_crypto_provider: calling install_default...");
+        log::error!("[certd] ensure_crypto_provider: calling install_default");
         match rustls::crypto::ring::default_provider().install_default() {
             Ok(()) => {
-                eprintln!("[certd] ensure_crypto_provider: OK");
-                log::info!("[certd] rustls crypto provider: ring installed");
+                log::error!("[certd] ensure_crypto_provider: OK");
             }
-            Err(_) => {
-                eprintln!("[certd] ensure_crypto_provider: FAILED");
-                log::warn!("[certd] rustls crypto provider: already installed or conflicting");
+            Err(e) => {
+                log::error!("[certd] ensure_crypto_provider: FAILED: {e:?}");
             }
         }
     });
-    eprintln!("[certd] ensure_crypto_provider: Once completed");
+    log::error!("[certd] ensure_crypto_provider: Once completed");
 }
 
 const CERT_PREFIX: &str = "nekoguard:cert:";
