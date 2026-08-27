@@ -356,7 +356,7 @@ impl AcmeClient {
         let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
         // Set CN to domain (rcgen defaults to "rcgen self signed cert")
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::COMMON_NAME, domain);
+        params.distinguished_name.push(rcgen::DnType::CommonName, domain);
         let csr = params.serialize_request(&key_pair)?;
         let csr_der = csr.der().to_vec();
         log::info!("[acme] CSR DER size: {} bytes", csr_der.len());
