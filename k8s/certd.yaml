@@ -13,11 +13,15 @@ spec:
       labels:
         app: nekoguard-certd
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: nekoguard-certd
           image: docker.io/library/nekoguard:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/nekoguard-certd"]
+          securityContext:
+            runAsUser: 0
           env:
             - name: NG_CONFIG
               value: /etc/nekoguard/nekoguard.toml
