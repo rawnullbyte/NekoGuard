@@ -1,10 +1,13 @@
 
 use crate::config::CONFIG;
+use http_body_util::BodyExt;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType,
+    HttpClient, BytesResponse, BodyWrapper,
     Identifier, LetsEncrypt, NewAccount, NewOrder, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 use std::sync::Once;
 use tokio::time::Duration;
 
@@ -30,6 +33,64 @@ pub struct CertData {
     pub expires_at: u64,
 }
 
+// ── Reqwest-based HTTP client for instant-acme ──────────────────────
+// instant-acme's DefaultClient uses try_with_platform_verifier() which
+// hangs in minimal containers. We wrap reqwest (which uses its own
+// cert store) and implement the HttpClient trait instead.
+
+struct ReqwestAcmeClient(reqwest::Client);
+
+impl HttpClient for ReqwestAcmeClient {
+    fn request(
+        &self,
+        req: http::Request<BodyWrapper<bytes::Bytes>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>>
+    {
+        let client = self.0.clone();
+        Box::pin(async move {
+            let (parts, mut body) = req.into_parts();
+            let body_bytes = Pin::new(&mut body).collect().await
+                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?
+                .to_bytes();
+
+            let url = parts.uri.to_string();
+            let method = parts.method.clone();
+            let mut req_builder = match method {
+                http::Method::GET => client.get(&url),
+                http::Method::POST => client.post(&url),
+                http::Method::PUT => client.put(&url),
+                http::Method::DELETE => client.delete(&url),
+                _ => client.request(method, &url),
+            };
+
+            for (key, value) in parts.headers.iter() {
+                req_builder = req_builder.header(key, value);
+            }
+
+            if !body_bytes.is_empty() {
+                req_builder = req_builder.body(body_bytes);
+            }
+
+            let response = req_builder.send().await
+                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
+
+            let status = response.status();
+            let resp_headers = response.headers().clone();
+            let resp_body = response.bytes().await
+                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
+
+            let mut builder = http::Response::builder().status(status);
+            for (key, value) in resp_headers.iter() {
+                builder = builder.header(key, value);
+            }
+            let http_resp = builder.body(reqwest::Body::from(resp_body))
+                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
+
+            Ok(BytesResponse::from(http_resp))
+        })
+    }
+}
+
 /// Run the ACME loop: issue/renew certs for all domains, store in Redis.
 pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
@@ -37,17 +98,14 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
     let cache_dir = std::env::temp_dir().join("nekoguard-certd");
     std::fs::create_dir_all(&cache_dir).ok();
 
-    // Test HTTPS connectivity
-    log::info!("[certd] testing HTTPS connectivity to Let's Encrypt...");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    match client.get(LetsEncrypt::Production.url().to_owned()).send().await {
-        Ok(resp) => log::info!("[certd] Let's Encrypt reachable: HTTP {}", resp.status()),
-        Err(e) => log::error!("[certd] Let's Encrypt unreachable: {e}"),
-    }
-
     let cf_client = CloudflareDns::new(&CONFIG.certd.cloudflare_api_token);
+
+    // Create reqwest-based ACME client (avoids platform-verifier hang)
+    let http_client = ReqwestAcmeClient(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?,
+    );
 
     // Create or load ACME account
     let creds_path = cache_dir.join("account_credentials.json");
@@ -57,35 +115,27 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
         let creds: AccountCredentials = serde_json::from_str(&creds_json)
             .expect("invalid stored account credentials");
         log::info!("[certd] loading existing ACME account");
-        Account::builder()?
+        Account::builder_with_http(Box::new(http_client))
             .from_credentials(creds)
             .await
             .expect("ACME account restore failed")
     } else {
         log::info!("[certd] creating new ACME account");
-        log::info!("[certd] calling Account::builder()...");
-        let builder = Account::builder()?;
-        log::info!("[certd] calling builder.create() (30s timeout)...");
-        let (account, credentials) = tokio::time::timeout(
-            Duration::from_secs(30),
-            builder.create(
-                &NewAccount {
-                    contact: &[&CONFIG.certd.contact_email],
-                    terms_of_service_agreed: true,
-                    only_return_existing: false,
-                },
-                LetsEncrypt::Production.url().to_owned(),
-                None,
-            ),
+        let builder = Account::builder_with_http(Box::new(http_client));
+        let (account, credentials) = builder.create(
+            &NewAccount {
+                contact: &[&CONFIG.certd.contact_email],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            LetsEncrypt::Production.url().to_owned(),
+            None,
         )
-        .await
-        .map_err(|_| -> Box<dyn std::error::Error> {
-            "ACME account creation timed out after 30s".into()
-        })??;
+        .await?;
         log::info!("[certd] ACME account created successfully");
         let creds_json = serde_json::to_string_pretty(&credentials).unwrap();
         let _ = std::fs::write(&creds_path, &creds_json);
-        log::info!("[certd] ACME account created");
+        log::info!("[certd] ACME account credentials saved");
         account
     };
 

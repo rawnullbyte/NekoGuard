@@ -1744,6 +1744,7 @@ version = "1.0.0"
 dependencies = [
  "bytes",
  "env_logger",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
