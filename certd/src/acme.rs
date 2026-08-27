@@ -47,6 +47,7 @@ fn jwk_thumbprint(key: &SigningKey) -> String {
         r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
         jwk["x"], jwk["y"]
     );
+    log::info!("[acme] JWK canonical: {canonical}");
     let hash = Sha256::digest(canonical.as_bytes());
     b64(&hash)
 }
@@ -304,6 +305,10 @@ impl AcmeClient {
         // Step 3: Compute DNS-01 challenge value
         let key_auth = format!("{token}.{}", self.thumbprint);
         let txt_value = b64(&Sha256::digest(key_auth.as_bytes()));
+        log::info!("[acme] token: {token}");
+        log::info!("[acme] thumbprint: {}", self.thumbprint);
+        log::info!("[acme] key_auth: {key_auth}");
+        log::info!("[acme] txt_value: {txt_value}");
         log::info!("[acme] set TXT _acme-challenge.{domain} = {txt_value}");
 
         // Step 4: Set DNS record via Cloudflare
