@@ -21,8 +21,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/nekoguard"]
           securityContext:
-            capabilities:
-              add: ["NET_BIND_SERVICE"]
+            runAsUser: 0
           env:
             - name: NG_CONFIG
               value: /etc/nekoguard/nekoguard.toml
