@@ -75,56 +75,49 @@ flowchart TB
 ### Full Config Example
 
 ```toml
-# ── TLS ───────────────────────────────────────────────────────────
-port = 443                            # TLS listen port
+# ── Shared (both certd and nekoguard) ─────────────────────────────
+domains = ["root-workspace.net", "immich.root-workspace.net"]
+redis_url = "redis://127.0.0.1:6379"
+contact_email = "you@example.com"
+cloudflare_api_token = "your-cloudflare-api-token"
+cloudflare_zone_id = "your-zone-id"
 
-# ── Whitelist ─────────────────────────────────────────────────────
-whitelist = ["127.0.0.1"]             # permanent IPs that bypass PoW
+# ── NekoGuard ─────────────────────────────────────────────────────
+[nekoguard]
+port = 443
+whitelist = ["127.0.0.1"]
 
-# ── Session ───────────────────────────────────────────────────────
-[session]
-cookie_name = "nekoguard_session"     # session cookie name
-ttl = 1800                           # session duration (seconds)
+[nekoguard.session]
+cookie_name = "nekoguard_session"
+ttl = 1800
 
-# ── Rate Limiting ─────────────────────────────────────────────────
-[rate_limit]
+[nekoguard.rate_limit]
 enabled = true
-rps = 10                              # requests per second
-rpm = 600                             # requests per minute
-burst = 20                            # burst capacity
+rps = 10
+rpm = 600
+burst = 20
 
-# ── Logging ───────────────────────────────────────────────────────
-[log]
-level = "info"                        # error, warn, info, debug
-file = "/var/log/nekoguard.log"       # omit = stdout only
-requests = true                      # log each request with timing
+[nekoguard.log]
+level = "info"
+file = "/var/log/nekoguard.log"
+requests = true
 
-# ── Redis ─────────────────────────────────────────────────────────
-[redis]
-url = "redis://127.0.0.1:6379"        # session state + signing secret
+# ── Sites (NekoGuard) ────────────────────────────────────────────
+[[nekoguard.sites]]
+domain = "root-workspace.net"
+upstream = "http://10.1.3.16:2283"
 
-# ── Backend Sites ─────────────────────────────────────────────────
-[[sites]]
-domain = "example.com"
-upstream = "http://10.0.0.5:2368"
-bypass = ["^/api/.*"]                 # skip PoW for API routes
+  [[nekoguard.sites.sub]]
+  name = "immich"
+  upstream = "http://10.1.3.16:2283"
 
-  [[sites.sub]]
-  name = "app"                        # app.example.com
-  upstream = "http://10.0.0.6:8080"
-
-  [[sites.sub]]
-  name = "www"                        # inherits parent's upstream
-
-  # Subdomain with rate limit override
-  [[sites.sub]]
-  name = "api"
-  upstream = "http://10.0.0.7:9000"
-  [site.rate_limit]
-  rps = 100
-  rpm = 10000
-  burst = 50
+# ── Certd ────────────────────────────────────────────────────────
+[certd]
+port = 8443
+renewal_interval = 86400
 ```
+
+### Path Bypass
 
 > [!TIP]
 > The `bypass` regexes are matched against the request path. Use `["^/api/.*"]` to exempt API routes, or `[".*"]` to disable PoW for an entire site. A sub's `bypass = []` overrides the parent's list and fully protects the sub.
@@ -134,40 +127,23 @@ bypass = ["^/api/.*"]                 # skip PoW for API routes
 
 ### Rate Limiting
 
-> [!NOTE]
-> Rate limits are enforced **after** a successful PoW solve. Each IP gets a token bucket that refills at `rps` tokens/second. If `rpm` is set, it acts as an additional per-minute ceiling.
-
 Rate limits cascade: **global → domain → subdomain**. Non-zero values override:
 
 ```toml
-# Global (all sites)
-[rate_limit]
+# Global defaults (applies to all sites)
+[nekoguard.rate_limit]
 rps = 10
 rpm = 600
 burst = 20
 
-# Domain override (applies to all subs)
-[[sites]]
-domain = "example.com"
+# Per-site override
+[[nekoguard.sites]]
+domain = "api.example.com"
 upstream = "http://10.0.0.5:2368"
-[site.rate_limit]
-rps = 50
-rpm = 5000
-burst = 30
-
-  # Sub override (overrides both global AND domain)
-  [[sites.sub]]
-  name = "admin"
-  upstream = "http://10.0.0.8:8080"
-  [site.rate_limit]
-  rps = 5
-  rpm = 100
-  burst = 3
-
-  # Sub without rate_limit → inherits parent domain (example.com)
-  [[sites.sub]]
-  name = "api"
-  upstream = "http://10.0.0.7:9000"
+[nekoguard.sites.rate_limit]
+rps = 100
+rpm = 10000
+burst = 50
 ```
 
 ### Environment Variables
@@ -190,66 +166,75 @@ burst = 30
 
 ## Deployment
 
-### Single Server
+### Quick Start (Docker Compose)
 
 ```bash
-# Build both binaries
+git clone https://github.com/rawnullbyte/NekoGuard.git
+cd NekoGuard
+
+# Edit nekoguard.toml with your domains, Redis, Cloudflare credentials
+
+docker compose up -d
+```
+
+This starts Redis, certd, and NekoGuard in one command.
+
+### Manual Setup
+
+```bash
+# 1. Build
 cargo build --release --workspace
 
-# Start Redis
+# 2. Start Redis
 redis-server &
 
-# Start certd (handles ACME, issues certs)
-NG_CERTD_CONFIG=certd.toml ./target/release/nekoguard-certd
+# 3. Start certd (issues certs via DNS-01)
+NG_CONFIG=nekoguard.toml ./target/release/nekoguard-certd &
 
-# Start nekoguard (reads certs from Redis)
+# 4. Wait for certd to issue certs (check: redis-cli GET nekoguard:cert:your-domain)
+
+# 5. Start NekoGuard
 sudo setcap 'cap_net_bind_service=+ep' target/release/nekoguard
 NG_CONFIG=nekoguard.toml ./target/release/nekoguard
 ```
 
-> [!CAUTION]
-> NekoGuard binds ports 80 and 443 directly. Run with `CAP_NET_BIND_SERVICE`, as root, or via `setcap`.
+### Kubernetes
 
-### Multi-Replica with Load Balancer
+```bash
+# 1. Create namespace and secrets
+kubectl apply -f k8s/namespace.yaml
+kubectl edit -f k8s/secret.yaml    # fill in real Cloudflare credentials
+kubectl apply -f k8s/secret.yaml
 
-```mermaid
-flowchart LR
-    DNS[DNS] --> LB[Load Balancer]
-    LB -->|SNI: example.com| R1[NekoGuard 1]
-    LB -->|SNI: other.com| R2[NekoGuard 2]
-    R1 --- Redis[(Redis)]
-    R2 --- Redis
-    R1 --> S1[example.com server]
-    R2 --> S2[other.com server]
+# 2. Create config (edit configmap.yaml with your domains first)
+kubectl apply -f k8s/configmap.yaml
+
+# 3. Start Redis
+kubectl apply -f k8s/redis.yaml
+
+# 4. Start certd (single replica)
+kubectl apply -f k8s/certd.yaml
+
+# 5. Wait for certd to issue certs, then start NekoGuard
+kubectl apply -f k8s/nekoguard.yaml
+
+# 6. Check status
+kubectl get pods -n nekoguard
+kubectl logs -f deployment/nekoguard-certd -n nekoguard
 ```
 
-> [!TIP]
-> Use TCP passthrough (`stream { ssl_preread on; }` in nginx) on the load balancer — NekoGuard handles TLS itself. SNI-based routing in the LB distributes connections to the correct NekoGuard instance.
+### Auto-Scaling NekoGuard
 
-#### nginx Load Balancer Config
+NekoGuard is stateless — all state lives in Redis. Scale based on CPU or connections:
 
-```nginx
-stream {
-    map $ssl_preread_server_name $backend {
-        example.com    nekoguard_1;
-        other.com      nekoguard_2;
-        default        nekoguard_1;
-    }
-
-    upstream nekoguard_1 { server 10.0.0.1:443; }
-    upstream nekoguard_2 { server 10.0.0.2:443; }
-
-    server {
-        listen 443;
-        listen [::]:443;
-        proxy_pass $backend;
-        ssl_preread on;
-    }
-}
+```bash
+kubectl autoscale deployment nekoguard \
+  --namespace nekoguard \
+  --min=2 --max=10 \
+  --cpu-percent=70
 ```
 
-> [!IMPORTANT]
-> The load balancer must use **TCP passthrough** (not HTTP termination) so NekoGuard can handle TLS itself and Let's Encrypt can validate via TLS-ALPN-01.
+Or with HorizontalPodAutoscaler YAML in `k8s/`:
 
 ---
 
@@ -275,7 +260,7 @@ url = "redis://127.0.0.1:6379"
 
 Certificates are managed by `nekoguard-certd` and stored in Redis. NekoGuard reads them on startup and holds them in memory.
 
-- certd handles issuance, renewal, and ACME challenges (via HTTP-01)
+- certd handles issuance, renewal, and ACME challenges (via DNS-01 + Cloudflare API)
 - Certs are stored in Redis, shared across all NekoGuard replicas
 - NekoGuard loads certs from Redis on startup — no local cache needed
 - Unknown domains are refused at the TLS handshake level
@@ -305,7 +290,7 @@ When exceeded: `429 Too Many Requests`
 
 ```mermaid
 flowchart LR
-    LE[Let's Encrypt] -->|TLS-ALPN-01| CD[certd]
+    LE[Let's Encrypt] -->|DNS-01| CD[certd]
     CD -->|cert + key| Redis[(Redis)]
     Redis -->|cert| NG1[NekoGuard 1]
     Redis -->|cert| NG2[NekoGuard 2]
@@ -318,31 +303,14 @@ flowchart LR
 ### Configuration
 
 ```toml
-# certd.toml
+# Shared nekoguard.toml (same file both binaries read)
 
-# Domains to manage certificates for
-domains = ["root-workspace.net", "immich.root-workspace.net"]
-
-# ACME account contacts (expiry notices)
-contacts = ["you@example.com"]
-
-# Certificate cache directory (local fallback)
-cache_dir = "./acme-cache"
-
-# Use Let's Encrypt staging while testing
-staging = false
-
-# Listen port for NekoGuard to query (internal use)
-port = 8443
-
-# Redis connection
-redis_url = "redis://127.0.0.1:6379"
+# certd uses: domains, redis_url, contact_email, cloudflare_*
+# + [certd] section for port and renewal_interval
 ```
 
-Set the config path via environment variable:
-
 ```bash
-NG_CERTD_CONFIG=/etc/nekoguard/certd.toml ./nekoguard-certd
+NG_CONFIG=/etc/nekoguard/nekoguard.toml ./nekoguard-certd
 ```
 
 ### Running
@@ -415,3 +383,62 @@ nekoguard_session=<ip>.<expiry_hex>.<nonce_hex>.<hmac_hex>
 
 > [!CAUTION]
 > The signing secret is generated once and stored in Redis. Deleting the `nekoguard:secret` key invalidates all sessions — all users must re-solve PoW.
+
+---
+
+## Docker
+
+Build and run with Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+Or build standalone:
+
+```bash
+docker build -t nekoguard .
+docker run -p 443:443 -p 80:80 \
+  -v ./nekoguard.toml:/etc/nekoguard/nekoguard.toml:ro \
+  -e NG_CONFIG=/etc/nekoguard/nekoguard.toml \
+  nekoguard
+```
+
+> [!NOTE]
+> The Dockerfile builds both `nekoguard` and `nekoguard-certd` binaries in a multi-stage build.
+
+---
+
+## Kubernetes
+
+```bash
+# Apply all manifests
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/secret.yaml    # Replace with real credentials
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/certd.yaml
+kubectl apply -f k8s/nekoguard.yaml
+```
+
+### Architecture
+
+```mermaid
+flowchart TB
+    LB[Load Balancer] --> NG[NekoGuard x2]
+    NG --> Redis[(Redis)]
+    CD[certd] --> Redis
+    CD --> LE[Let's Encrypt]
+    LE -->|DNS-01| CF[Cloudflare]
+    NG --> B1[Service 1]
+    NG --> B2[Service 2]
+```
+
+| Component | Replicas | Purpose |
+|-----------|----------|---------|
+| Redis | 1 | Session state + certs |
+| certd | 1 | ACME issuance + renewal |
+| NekoGuard | 2+ | TLS edge + PoW + proxy |
+
+> [!TIP]
+> NekoGuard scales horizontally — add replicas and point your load balancer. All state is in Redis. certd is single-instance (handles ACME lock internally).

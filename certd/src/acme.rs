@@ -1,9 +1,8 @@
-use std::sync::Arc;
 
 use crate::config::CONFIG;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, CryptoProvider,
-    DefaultClient, Identifier, LetsEncrypt, NewAccount, NewOrder, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType,
+    Identifier, LetsEncrypt, NewAccount, NewOrder, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
@@ -32,37 +31,28 @@ pub async fn run_acme_loop(redis_url: &str) -> Result<(), Box<dyn std::error::Er
     // Create or load ACME account
     let creds_path = cache_dir.join("account_credentials.json");
 
-    macro_rules! new_http_client {
-        () => {
-            Box::new(DefaultClient::new(Arc::new(rustls::crypto::ring::default_provider()))?)
-        };
-    }
-
     let account = if creds_path.exists() {
         let creds_json = std::fs::read_to_string(&creds_path).unwrap_or_default();
         let creds: AccountCredentials = serde_json::from_str(&creds_json)
             .expect("invalid stored account credentials");
         log::info!("[certd] loading existing ACME account");
-        Account::builder(new_http_client!(), CryptoProvider::ring())?
+        Account::builder()?
             .from_credentials(creds)
             .await
             .expect("ACME account restore failed")
     } else {
         log::info!("[certd] creating new ACME account");
-        let (account, credentials) = Account::builder(
-            new_http_client!(),
-            CryptoProvider::ring(),
-        )?
-        .create(
-            &NewAccount {
-                contact: &[&CONFIG.contact_email],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            LetsEncrypt::Production.url().to_owned(),
-            None,
-        )
-        .await?;
+        let (account, credentials) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &[&CONFIG.contact_email],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                LetsEncrypt::Production.url().to_owned(),
+                None,
+            )
+            .await?;
         let creds_json = serde_json::to_string_pretty(&credentials).unwrap();
         let _ = std::fs::write(&creds_path, &creds_json);
         log::info!("[certd] ACME account created");
@@ -76,7 +66,7 @@ pub async fn run_acme_loop(redis_url: &str) -> Result<(), Box<dyn std::error::Er
 
     // Renewal loop
     loop {
-        tokio::time::sleep(Duration::from_secs(CONFIG.renewal_interval)).await;
+        tokio::time::sleep(Duration::from_secs(CONFIG.certd.renewal_interval)).await;
         log::info!("[certd] checking renewals...");
         let mut redis = redis::Client::open(redis_url)
             .expect("redis connect")
@@ -124,7 +114,7 @@ async fn issue_or_renew(
         }
 
         if let Some(mut challenge) = authz.challenge(ChallengeType::Dns01) {
-            let key_auth = challenge.key_authorization().expect("key auth failed");
+            let key_auth = challenge.key_authorization();
             let dns_value = key_auth.dns_value();
             let dns_name = format!("_acme-challenge.{domain}");
 

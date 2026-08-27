@@ -153,7 +153,6 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ConfigToml {
     #[serde(default)]
     sites: Vec<SiteToml>,

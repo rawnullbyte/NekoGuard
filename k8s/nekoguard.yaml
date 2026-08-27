@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nekoguard
+  namespace: nekoguard
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nekoguard
+  template:
+    metadata:
+      labels:
+        app: nekoguard
+    spec:
+      containers:
+        - name: nekoguard
+          image: nekoguard:latest
+          command: ["/usr/local/bin/nekoguard"]
+          ports:
+            - containerPort: 443
+              name: https
+            - containerPort: 80
+              name: http
+          env:
+            - name: NG_CONFIG
+              value: /etc/nekoguard/nekoguard.toml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nekoguard/nekoguard.toml
+              subPath: nekoguard.toml
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            tcpSocket:
+              port: 443
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 443
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: nekoguard-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nekoguard
+  namespace: nekoguard
+spec:
+  type: LoadBalancer
+  selector:
+    app: nekoguard
+  ports:
+    - port: 443
+      targetPort: 443
+      name: https
+    - port: 80
+      targetPort: 80
+      name: http

@@ -67,7 +67,7 @@ async fn main() {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    log::info!("nekoguard-certd starting on :{}", CONFIG.port);
+    log::info!("nekoguard-certd starting on :{}", CONFIG.certd.port);
 
     // Start ACME issuance/renewal loop in background
     let redis_url = CONFIG.redis_url.clone();
@@ -76,9 +76,9 @@ async fn main() {
     });
 
     // HTTP server for cert queries
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], CONFIG.port));
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], CONFIG.certd.port));
     let listener = TcpListener::bind(addr).await.expect("bind failed");
-    log::info!("nekoguard-certd ready on :{}", CONFIG.port);
+    log::info!("nekoguard-certd ready on :{}", CONFIG.certd.port);
 
     loop {
         let (tcp, _) = match listener.accept().await {

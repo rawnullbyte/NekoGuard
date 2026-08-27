@@ -2,4 +2,3 @@
 members = ["nekoguard", "certd"]
 
 [workspace.dependencies]
-instant-acme = { path = "../instant-acme", features = ["ring"] }

@@ -1,20 +1,21 @@
 # nekoguard-certd configuration
-# Handles ACME certificate issuance for all NekoGuard instances.
+# Handles ACME certificate issuance via DNS-01 for all NekoGuard instances.
 
 # Domains to manage certificates for
 domains = ["root-workspace.net", "immich.root-workspace.net"]
 
-# ACME account contacts
-contacts = ["you@example.com"]
-
-# Certificate cache directory
-cache_dir = "./acme-cache"
-
-# Use LE staging while testing
-staging = false
-
-# Listen port for NekoGuard to query
+# Listen port (internal use for cert queries)
 port = 8443
 
 # Redis connection
 redis_url = "redis://127.0.0.1:6379"
+
+# ACME account contact email
+contact_email = "you@example.com"
+
+# Cloudflare DNS-01 credentials
+cloudflare_api_token = "your-cloudflare-api-token"
+cloudflare_zone_id = "your-zone-id"
+
+# How often to check for cert renewals (seconds, default: 86400 = 24h)
+renewal_interval = 86400

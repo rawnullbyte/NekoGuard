@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nekoguard-certd
+  namespace: nekoguard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nekoguard-certd
+  template:
+    metadata:
+      labels:
+        app: nekoguard-certd
+    spec:
+      containers:
+        - name: nekoguard-certd
+          image: nekoguard:latest
+          command: ["/usr/local/bin/nekoguard-certd"]
+          env:
+            - name: NG_CONFIG
+              value: /etc/nekoguard/nekoguard.toml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nekoguard/nekoguard.toml
+              subPath: nekoguard.toml
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: nekoguard-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nekoguard-certd
+  namespace: nekoguard
+spec:
+  selector:
+    app: nekoguard-certd
+  ports:
+    - port: 8443

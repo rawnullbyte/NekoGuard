@@ -1,0 +1,35 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+
+  certd:
+    build: .
+    command: ["/usr/local/bin/nekoguard-certd"]
+    volumes:
+      - ./nekoguard.toml:/etc/nekoguard/nekoguard.toml:ro
+    environment:
+      - NG_CONFIG=/etc/nekoguard/nekoguard.toml
+    depends_on:
+      - redis
+
+  nekoguard:
+    build: .
+    command: ["/usr/local/bin/nekoguard"]
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nekoguard.toml:/etc/nekoguard/nekoguard.toml:ro
+    environment:
+      - NG_CONFIG=/etc/nekoguard/nekoguard.toml
+    depends_on:
+      - redis
+      - certd
+
+volumes:
+  redis-data:
