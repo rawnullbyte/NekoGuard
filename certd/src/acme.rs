@@ -353,7 +353,9 @@ impl AcmeClient {
         // Step 8: Finalize with CSR
         log::info!("[acme] finalizing order with CSR");
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-        let params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
+        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
+        // Ensure SAN is set (ACME requires it in the CSR, not just CN)
+        params.subject_alt_names = vec![rcgen::SanType::DnsName(domain.to_string())];
         let csr = params.serialize_request(&key_pair)?;
         let csr_der = csr.der().to_vec();
         let csr_b64 = b64(&csr_der);
@@ -370,9 +372,10 @@ impl AcmeClient {
 
         // Step 9: Poll for certificate
         let finalize_resp: serde_json::Value = resp.json().await?;
+        log::info!("[acme] finalize response: {finalize_resp}");
         let cert_url = finalize_resp["certificate"]
             .as_str()
-            .ok_or("no certificate URL in finalize response")?
+            .ok_or(format!("no certificate URL in finalize response: {finalize_resp}"))?
             .to_string();
 
         for attempt in 0..30 {
