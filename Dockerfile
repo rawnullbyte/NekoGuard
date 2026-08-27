@@ -5,9 +5,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY nekoguard/ nekoguard/
 COPY certd/ certd/
 
-# Diagnostic: print resolved features before building
-RUN cargo tree -p nekoguard-certd -f '{p} features={f}' | grep rustls && \
-    cargo tree -p nekoguard-certd -i aws-lc-rs 2>&1 || true
+# Diagnostic: print resolved features to stderr
+RUN echo "=== RUSTLS FEATURES ===" 1>&2 && \
+    cargo tree -p nekoguard-certd -f '{p} features={f}' 1>&2 | grep "rustls " && \
+    echo "=== AWS-LC-RS CHECK ===" 1>&2 && \
+    (cargo tree -p nekoguard-certd -i aws-lc-rs 1>&2 || echo "aws-lc-rs NOT IN TREE" 1>&2) && \
+    echo "=== DONE ===" 1>&2
 
 RUN cargo build --release --workspace
 
