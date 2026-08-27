@@ -5,7 +5,20 @@ use instant_acme::{
     Identifier, LetsEncrypt, NewAccount, NewOrder, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Once;
 use tokio::time::Duration;
+
+/// Ensure exactly one rustls crypto provider (ring) is installed.
+/// Called at the top of the ACME loop so it runs on the tokio worker thread.
+fn ensure_crypto_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        match rustls::crypto::ring::default_provider().install_default() {
+            Ok(()) => log::info!("[certd] rustls crypto provider: ring installed"),
+            Err(_) => log::warn!("[certd] rustls crypto provider: already installed or conflicting"),
+        }
+    });
+}
 
 const CERT_PREFIX: &str = "nekoguard:cert:";
 
@@ -19,6 +32,8 @@ pub struct CertData {
 
 /// Run the ACME loop: issue/renew certs for all domains, store in Redis.
 pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_crypto_provider();
+
     let cache_dir = std::env::temp_dir().join("nekoguard-certd");
     std::fs::create_dir_all(&cache_dir).ok();
 
