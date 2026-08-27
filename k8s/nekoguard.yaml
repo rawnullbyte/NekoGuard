@@ -58,13 +58,15 @@ metadata:
   name: nekoguard
   namespace: nekoguard
 spec:
-  type: LoadBalancer
+  type: NodePort
   selector:
     app: nekoguard
   ports:
     - port: 443
       targetPort: 443
+      nodePort: 30443
       name: https
     - port: 80
       targetPort: 80
+      nodePort: 30080
       name: http

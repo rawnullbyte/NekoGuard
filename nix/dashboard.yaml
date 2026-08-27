@@ -1,0 +1,60 @@
+# Kubernetes Dashboard
+# Apply after k3s is up: kubectl apply -f dashboard.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubernetes-dashboard
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: admin-user
+    namespace: kubernetes-dashboard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-dashboard
+  namespace: kubernetes-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-dashboard
+  template:
+    metadata:
+      labels:
+        app: kubernetes-dashboard
+    spec:
+      serviceAccountName: admin-user
+      containers:
+        - name: dashboard
+          image: kubernetesui/dashboard:v2.7.0
+          ports:
+            - containerPort: 8443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-dashboard
+  namespace: kubernetes-dashboard
+spec:
+  type: LoadBalancer
+  selector:
+    app: kubernetes-dashboard
+  ports:
+    - port: 443
+      targetPort: 8443

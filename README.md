@@ -443,3 +443,7 @@ flowchart TB
 
 > [!TIP]
 > NekoGuard scales horizontally — add replicas and point your load balancer. All state is in Redis. certd is single-instance (handles ACME lock internally).
+
+Access via NodePort:
+- NekoGuard: `https://<NODE_IP>:30443`
+- Dashboard: `https://<NODE_IP>:30443`
