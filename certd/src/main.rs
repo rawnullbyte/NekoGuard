@@ -80,7 +80,7 @@ async fn main() {
     let domains: Vec<String> = CONFIG.sites.iter().map(|s| s.domain.clone()).collect();
     let redis_url = CONFIG.redis.url.clone();
     tokio::spawn(async move {
-        acme::run_acme_loop(&redis_url, &domains).await;
+        let _ = acme::run_acme_loop(&redis_url, &domains).await;
     });
 
     // HTTP server for cert queries

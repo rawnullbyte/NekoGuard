@@ -16,7 +16,7 @@ log = "0.4.34"
 env_logger = "0.11"
 redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12", features = ["json"] }
-instant-acme = { version = "0.8.5", features = ["ring"] }
-rustls = { version = "0.23.43", features = ["ring"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "logging"] }
 
 

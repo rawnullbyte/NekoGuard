@@ -21,6 +21,7 @@ pub struct Site {
     pub bypass: Vec<regex::Regex>,
 
     /// Effective rate limit for this site (global defaults + per-site overrides).
+    #[allow(dead_code)]
     pub rate_limit: RateLimitConfig,
 }
 
@@ -153,6 +154,7 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ConfigToml {
     #[serde(default)]
     sites: Vec<SiteToml>,
@@ -180,6 +182,7 @@ struct ConfigToml {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[allow(dead_code)]
 struct NekoguardSub {
     #[serde(default = "default_port")]
     port: u16,
@@ -194,6 +197,7 @@ struct NekoguardSub {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[allow(dead_code)]
 struct CertdSub {
     #[serde(default)]
     port: Option<u16>,

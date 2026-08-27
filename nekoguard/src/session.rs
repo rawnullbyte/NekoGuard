@@ -53,6 +53,7 @@ pub struct SessionManager {
 impl SessionManager {
     /// Create a new SessionManager. The secret is loaded from Redis.
     /// If Redis doesn't have a secret yet, one is generated and stored.
+    #[allow(dead_code)]
     pub async fn new(redis: &redis::Client) -> Self {
         let mut conn = redis.get_multiplexed_async_connection().await.expect("redis connect");
         let secret = Self::get_or_create_secret(&mut conn).await;
