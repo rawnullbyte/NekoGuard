@@ -63,6 +63,9 @@ async fn handle(
 
 #[tokio::main]
 async fn main() {
+    // Write to file FIRST — bypasses all logging/stderr issues
+    let _ = std::fs::write("/tmp/certd-debug.log", "main() started\n");
+
     // Simple stderr logger
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
@@ -70,12 +73,15 @@ async fn main() {
 
     // Install rustls crypto provider before any TLS operations.
     log::error!("[certd] CALLED: install_default");
+    let _ = std::fs::write("/tmp/certd-debug.log", "before install_default\n");
     match rustls::crypto::ring::default_provider().install_default() {
         Ok(()) => {
             log::error!("[certd] RESULT: install_default OK");
+            let _ = std::fs::write("/tmp/certd-debug.log", "install_default OK\n");
         }
         Err(e) => {
             log::error!("[certd] RESULT: install_default FAILED: {e:?}");
+            let _ = std::fs::write("/tmp/certd-debug.log", format!("install_default FAILED: {e:?}\n"));
         }
     }
 
