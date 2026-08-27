@@ -55,7 +55,7 @@ impl HttpClient for ReqwestAcmeClient {
                 .map_err(|e| instant_acme::Error::Other(Box::new(e)))?
                 .to_bytes();
 
-            log::info!("[certd-acme-http] body collected, sending via reqwest...");
+            log::info!("[certd-acme-http] body collected ({}B), sending via reqwest...", body_bytes.len());
             let url = parts.uri.to_string();
             let method = parts.method.clone();
             let mut req_builder = match method {
@@ -74,10 +74,15 @@ impl HttpClient for ReqwestAcmeClient {
                 req_builder = req_builder.body(body_bytes);
             }
 
+            log::info!("[certd-acme-http] awaiting reqwest response...");
             let response = req_builder.send().await
-                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
+                .map_err(|e| {
+                    log::error!("[certd-acme-http] reqwest error: {e}");
+                    instant_acme::Error::Other(Box::new(e))
+                })?;
 
             let status = response.status();
+            log::info!("[certd-acme-http] got response: {status}");
             let resp_headers = response.headers().clone();
             let resp_body = response.bytes().await
                 .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
