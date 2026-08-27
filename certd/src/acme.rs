@@ -53,7 +53,10 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
             .expect("ACME account restore failed")
     } else {
         log::info!("[certd] creating new ACME account");
-        let (account, credentials) = Account::builder()?
+        log::info!("[certd] calling Account::builder()...");
+        let builder = Account::builder()?;
+        log::info!("[certd] calling builder.create()...");
+        let (account, credentials) = builder
             .create(
                 &NewAccount {
                     contact: &[&CONFIG.certd.contact_email],
@@ -64,6 +67,7 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
                 None,
             )
             .await?;
+        log::info!("[certd] ACME account created successfully");
         let creds_json = serde_json::to_string_pretty(&credentials).unwrap();
         let _ = std::fs::write(&creds_path, &creds_json);
         log::info!("[certd] ACME account created");
