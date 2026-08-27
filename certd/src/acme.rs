@@ -1,18 +1,13 @@
-
 use crate::config::CONFIG;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType,
-    HttpClient, BytesResponse, BodyWrapper,
-    Identifier, LetsEncrypt, NewAccount, NewOrder, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, BytesBody, BytesResponse,
+    ChallengeType, HttpClient, Identifier, LetsEncrypt, NewAccount, NewOrder, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
 use std::sync::Once;
 use tokio::time::Duration;
-use http_body_util::BodyExt;
 
 /// Ensure exactly one rustls crypto provider (ring) is installed.
-/// Called at the top of the ACME loop so it runs on the tokio worker thread.
 fn ensure_crypto_provider() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -33,9 +28,22 @@ pub struct CertData {
     pub expires_at: u64,
 }
 
-// ── Reqwest-based HTTP client for instant-acme ──────────────────────
+// ── Buffered body: returns pre-read bytes instantly, no I/O ──────
+
+struct BufferedBody(bytes::Bytes);
+
+#[async_trait::async_trait]
+impl BytesBody for BufferedBody {
+    async fn into_bytes(
+        &mut self,
+    ) -> Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        Ok(std::mem::take(&mut self.0))
+    }
+}
+
+// ── Reqwest-based HTTP client for instant-acme ───────────────────
 // instant-acme's DefaultClient uses try_with_platform_verifier() which
-// hangs in minimal containers. We wrap reqwest (which uses its own
+// hangs in minimal containers. We wrap reqwest (which has its own
 // cert store) and implement the HttpClient trait instead.
 
 struct ReqwestAcmeClient(reqwest::Client);
@@ -43,64 +51,85 @@ struct ReqwestAcmeClient(reqwest::Client);
 impl HttpClient for ReqwestAcmeClient {
     fn request(
         &self,
-        req: http::Request<BodyWrapper<bytes::Bytes>>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>>
-    {
+        req: http::Request<instant_acme::BodyWrapper<bytes::Bytes>>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<BytesResponse, instant_acme::Error>>
+                + Send,
+        >,
+    > {
         let client = self.0.clone();
         Box::pin(async move {
             let (parts, mut body) = req.into_parts();
-            log::info!("[certd-acme-http] {} {}", parts.method, parts.uri);
 
-            let body_bytes = body.collect().await
-                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?
-                .to_bytes();
+            // Pre-buffer request body
+            let body_bytes = {
+                use http_body_util::BodyExt;
+                body.collect()
+                    .await
+                    .map_err(|e| instant_acme::Error::Other(Box::new(e)))?
+                    .to_bytes()
+            };
 
-            log::info!("[certd-acme-http] body collected ({}B), sending via reqwest...", body_bytes.len());
+            log::info!("[acme-http] {} {}", parts.method, parts.uri);
+
             let url = parts.uri.to_string();
             let method = parts.method.clone();
-            let mut req_builder = match method {
+            let mut rb = match method {
                 http::Method::GET => client.get(&url),
                 http::Method::POST => client.post(&url),
                 http::Method::PUT => client.put(&url),
+                http::Method::HEAD => client.head(&url),
                 http::Method::DELETE => client.delete(&url),
                 _ => client.request(method, &url),
             };
 
             for (key, value) in parts.headers.iter() {
-                req_builder = req_builder.header(key, value);
+                rb = rb.header(key, value);
             }
 
             if !body_bytes.is_empty() {
-                req_builder = req_builder.body(body_bytes);
+                rb = rb.body(body_bytes);
             }
 
-            log::info!("[certd-acme-http] awaiting reqwest response...");
-            let response = req_builder.send().await
-                .map_err(|e| {
-                    log::error!("[certd-acme-http] reqwest error: {e}");
-                    instant_acme::Error::Other(Box::new(e))
-                })?;
-
-            let status = response.status();
-            log::info!("[certd-acme-http] got response: {status}");
-            let resp_headers = response.headers().clone();
-            let resp_body = response.bytes().await
+            // Send and fully buffer response (avoids BodyWrapper::into_bytes hang)
+            let response = rb
+                .send()
+                .await
                 .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
 
+            let status = response.status();
+            let resp_headers = response.headers().clone();
+            let resp_body = response
+                .bytes()
+                .await
+                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
+
+            log::info!("[acme-http] {} → {status} ({}B)", parts.uri, resp_body.len());
+
+            // Build BytesResponse with BufferedBody — no BodyWrapper, no hang.
+            // Clone body (cheap ref-count bump) so we can extract Parts from a response.
+            let body_clone = resp_body.clone();
             let mut builder = http::Response::builder().status(status);
             for (key, value) in resp_headers.iter() {
                 builder = builder.header(key, value);
             }
-            let http_resp = builder.body(reqwest::Body::from(resp_body))
-                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
+            let (resp_parts, _) = builder.body(resp_body).expect("infallible").into_parts();
 
-            Ok(BytesResponse::from(http_resp))
+            Ok(BytesResponse {
+                parts: resp_parts,
+                body: Box::new(BufferedBody(body_clone)),
+            })
         })
     }
 }
 
-/// Run the ACME loop: issue/renew certs for all domains, store in Redis.
-pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+// ── ACME loop ───────────────────────────────────────────────────
+
+pub async fn run_acme_loop(
+    redis_url: &str,
+    domains: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
 
     let cache_dir = std::env::temp_dir().join("nekoguard-certd");
@@ -120,8 +149,8 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
 
     let account = if creds_path.exists() {
         let creds_json = std::fs::read_to_string(&creds_path).unwrap_or_default();
-        let creds: AccountCredentials = serde_json::from_str(&creds_json)
-            .expect("invalid stored account credentials");
+        let creds: AccountCredentials =
+            serde_json::from_str(&creds_json).expect("invalid stored account credentials");
         log::info!("[certd] loading existing ACME account");
         Account::builder_with_http(Box::new(http_client))
             .from_credentials(creds)
@@ -130,20 +159,20 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
     } else {
         log::info!("[certd] creating new ACME account");
         let builder = Account::builder_with_http(Box::new(http_client));
-        let (account, credentials) = builder.create(
-            &NewAccount {
-                contact: &[&CONFIG.certd.contact_email],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            LetsEncrypt::Production.url().to_owned(),
-            None,
-        )
-        .await?;
-        log::info!("[certd] ACME account created successfully");
+        let (account, credentials) = builder
+            .create(
+                &NewAccount {
+                    contact: &[&CONFIG.certd.contact_email],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                LetsEncrypt::Production.url().to_owned(),
+                None,
+            )
+            .await?;
+        log::info!("[certd] ACME account created");
         let creds_json = serde_json::to_string_pretty(&credentials).unwrap();
         let _ = std::fs::write(&creds_path, &creds_json);
-        log::info!("[certd] ACME account credentials saved");
         account
     };
 
@@ -190,7 +219,6 @@ async fn issue_or_renew(
         .await
         .expect("ACME order creation failed");
 
-    // Process authorizations
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
         let mut authz = result.expect("authorization failed");
@@ -207,7 +235,8 @@ async fn issue_or_renew(
             let dns_name = format!("_acme-challenge.{domain}");
 
             log::info!("[certd] setting DNS record: {dns_name} = {dns_value}");
-            cf.set_txt_record(domain, &dns_name, &dns_value).await
+            cf.set_txt_record(domain, &dns_name, &dns_value)
+                .await
                 .expect("failed to set DNS record");
 
             challenge.set_ready().await.expect("challenge ready failed");
@@ -215,13 +244,11 @@ async fn issue_or_renew(
         }
     }
 
-    // Wait for order to be ready
     order
         .poll_ready(&RetryPolicy::default())
         .await
         .expect("order not ready");
 
-    // Finalize and get cert
     let private_key_pem = order.finalize().await.expect("finalize failed");
     let cert_chain_pem = order
         .poll_certificate(&RetryPolicy::default())
@@ -247,7 +274,6 @@ async fn issue_or_renew(
         .expect("redis conn manager");
     store_cert(&mut redis, domain, &cert).await;
 
-    // Notify NekoGuard replicas via Redis Pub/Sub
     let _: () = redis::cmd("PUBLISH")
         .arg("nekoguard:cert:update")
         .arg(domain)
@@ -259,7 +285,7 @@ async fn issue_or_renew(
     log::info!("[certd] cert issued and stored for {domain}");
 }
 
-// ── Cloudflare DNS-01 helper ──────────────────────────────────────
+// ── Cloudflare DNS-01 helper ────────────────────────────────────
 
 struct CloudflareDns {
     client: reqwest::Client,
@@ -274,9 +300,7 @@ impl CloudflareDns {
         }
     }
 
-    /// Look up the Cloudflare zone ID for a domain.
     async fn get_zone_id(&self, domain: &str) -> Result<String, Box<dyn std::error::Error>> {
-        // Extract the root domain (e.g. "foo.bar.example.com" → "example.com")
         let parts: Vec<&str> = domain.rsplitn(3, '.').collect();
         let root_domain = if parts.len() >= 2 {
             format!("{}.{}", parts[1], parts[0])
@@ -289,9 +313,13 @@ impl CloudflareDns {
             root_domain
         );
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_token),
+            )
             .send()
             .await?;
 
@@ -302,7 +330,8 @@ impl CloudflareDns {
 
         let data: serde_json::Value = resp.json().await?;
         let zones = data["result"].as_array().ok_or("no zones found")?;
-        let zone_id = zones.first()
+        let zone_id = zones
+            .first()
             .and_then(|z| z["id"].as_str())
             .ok_or("zone ID not found")?
             .to_string();
@@ -311,7 +340,12 @@ impl CloudflareDns {
         Ok(zone_id)
     }
 
-    async fn set_txt_record(&self, domain: &str, name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn set_txt_record(
+        &self,
+        domain: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let zone_id = self.get_zone_id(domain).await?;
         let url = format!(
             "https://api.cloudflare.com/client/v4/zones/{}/dns_records",
@@ -325,9 +359,13 @@ impl CloudflareDns {
             "ttl": 120
         });
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_token),
+            )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -341,7 +379,7 @@ impl CloudflareDns {
     }
 }
 
-// ── Redis cert storage ────────────────────────────────────────────
+// ── Redis cert storage ──────────────────────────────────────────
 
 async fn store_cert(
     redis: &mut redis::aio::ConnectionManager,
