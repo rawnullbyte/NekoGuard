@@ -43,9 +43,10 @@ fn jwk_public(key: &SigningKey) -> serde_json::Value {
 fn jwk_thumbprint(key: &SigningKey) -> String {
     let jwk = jwk_public(key);
     // Canonical form: lexicographic order, no whitespace
+    let x = jwk["x"].as_str().unwrap_or("");
+    let y = jwk["y"].as_str().unwrap_or("");
     let canonical = format!(
-        r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
-        jwk["x"], jwk["y"]
+        r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#,
     );
     log::info!("[acme] JWK canonical: {canonical}");
     let hash = Sha256::digest(canonical.as_bytes());
