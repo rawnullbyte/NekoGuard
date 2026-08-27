@@ -7,9 +7,7 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
-http-body-util = "0.1"
 bytes = "1"
-http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.4"
@@ -19,7 +17,11 @@ redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "logging"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
-async-trait = "0.1"
+sha2 = "0.11.0"
+base64 = "0.23.1"
+rand = "0.10.2"
+rcgen = "0.14.9"
+http-body-util = "0.1.5"
+rand_core = "0.10.1"
 
 
