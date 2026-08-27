@@ -107,6 +107,9 @@ impl HttpClient for ReqwestAcmeClient {
                 .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
 
             log::info!("[acme-http] {} → {status} ({}B)", parts.uri, resp_body.len());
+            if !status.is_success() {
+                log::info!("[acme-http] error body: {}", String::from_utf8_lossy(&resp_body));
+            }
 
             // Build BytesResponse with BufferedBody — no BodyWrapper, no hang.
             // Clone body (cheap ref-count bump) so we can extract Parts from a response.
