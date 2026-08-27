@@ -1,4 +1,12 @@
 [workspace]
 members = ["nekoguard", "certd"]
+resolver = "2"
 
 [workspace.dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -460,15 +460,14 @@ async fn handle(
         .and_then(|s| s.parse().ok())
         .or(Some(peer_ip));
 
-    // Routing is config-only: resolve the site from the request Host. The
-    // client-controlled X-Upstream header is deliberately ignored — trusting it
-    // would let anyone turn the proxy into an open proxy.
+    // Routing: resolve the site from the request Host, or fall back to catchall.
     let upstream = req
         .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
         .and_then(|h| CONFIG.site_for_host(h))
-        .map(|s| s.upstream.clone());
+        .map(|s| s.upstream.clone())
+        .or_else(|| CONFIG.catchall.as_ref().map(|c| c.upstream.clone()));
 
     if path == "/__ng/verify" && method == Method::POST {
         let bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
@@ -520,15 +519,21 @@ async fn handle(
     // Also allow permanent whitelist IPs
     let allowed = session_valid || real_ip.map(|ip| PERM.contains(&ip)).unwrap_or(false);
 
-    // Path bypass: requests whose path matches one of the site's bypass
-    // regexes are proxied without the challenge (APIs and machine routes).
+    // Path bypass: check site bypass, then catchall bypass as fallback.
     let host = req.headers().get("host").and_then(|v| v.to_str().ok());
+    let req_path = req.uri().path();
     let bypass_match = host
         .and_then(|h| CONFIG.site_for_host(h))
         .and_then(|site| {
-            let req_path = req.uri().path();
             if site.bypass.iter().any(|re| re.is_match(req_path)) {
-                Some(site)
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            if CONFIG.catchall_bypass.iter().any(|re| re.is_match(req_path)) {
+                Some(true)
             } else {
                 None
             }
@@ -538,8 +543,9 @@ async fn handle(
         // Rate limit check (only for cookie-authenticated, not bypass)
         if allowed && bypass_match.is_none() {
             if let Some(ip) = real_ip {
-                let site_rl = bypass_match
-                    .map(|s| &s.rate_limit)
+                let site_rl = CONFIG.catchall
+                    .as_ref()
+                    .and_then(|c| c.rate_limit.as_ref())
                     .unwrap_or(&CONFIG.rate_limit);
                 let mut conn = redis_conn.lock().await;
                 if !ratelimit::allow(&mut conn, ip, site_rl).await {
@@ -858,10 +864,15 @@ async fn main_inner() {
             match start_handshake.client_hello().server_name() {
                 Some(name) if CONFIG.is_known_domain(name) => {}
                 _ => {
-                    log::warn!(
-                        "tls: refused handshake for unknown/absent SNI from {peer_ip}"
-                    );
-                    return;
+                    if CONFIG.catchall.is_none() {
+                        log::warn!(
+                            "tls: refused handshake for unknown/absent SNI from {peer_ip}"
+                        );
+                        return;
+                    }
+                    // Catch-all: proceed with the request using any available cert.
+                    // The browser will see a cert mismatch — user opted into this.
+                    log::info!("[tls] catch-all for unknown SNI from {peer_ip}");
                 }
             }
 

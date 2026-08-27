@@ -182,6 +182,19 @@ struct ConfigToml {
     /// Permanent IP whitelist — these IPs bypass PoW entirely.
     #[serde(default)]
     whitelist: Vec<String>,
+
+    /// Catch-all for unknown SNI. If set, unmatched domains are proxied here.
+    #[serde(default)]
+    catchall: Option<CatchallConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CatchallConfig {
+    pub upstream: String,
+    #[serde(default)]
+    pub bypass: Vec<String>,
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Runtime config: the on-disk shape with `[[sites.sub]]` entries expanded
@@ -196,6 +209,8 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     pub redis_url: String,
     pub whitelist: Vec<IpAddr>,
+    pub catchall: Option<CatchallConfig>,
+    pub catchall_bypass: Vec<regex::Regex>,
 }
 
 fn default_port() -> u16 {
@@ -319,6 +334,12 @@ fn expand(raw: ConfigToml, path: &str) -> Config {
         rate_limit: global_rl,
         redis_url: raw.redis_url,
         whitelist,
+        catchall: raw.catchall.clone(),
+        catchall_bypass: raw.catchall.as_ref().map(|c| {
+            c.bypass.iter().map(|p| {
+                regex::Regex::new(p).unwrap_or_else(|e| panic!("bad catchall bypass '{p}': {e}"))
+            }).collect()
+        }).unwrap_or_default(),
     }
 }
 
