@@ -102,6 +102,49 @@ static PERM: LazyLock<HashSet<IpAddr>> = LazyLock::new(|| {
 });
 
 
+// Load TLS config from Redis certs via an Arc reference
+async fn load_tls_config(redis_conn: &Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>) -> Arc<rustls::ServerConfig> {
+    let mut conn = redis_conn.lock().await;
+    build_tls_config(&mut conn).await
+}
+
+// Load TLS config directly from Redis URL
+async fn load_tls_config_raw(redis_url: &str) -> Arc<rustls::ServerConfig> {
+    let mut conn = redis::Client::open(redis_url)
+        .expect("redis connect")
+        .get_connection_manager()
+        .await
+        .expect("redis conn manager");
+    build_tls_config(&mut conn).await
+}
+
+async fn build_tls_config(conn: &mut redis::aio::ConnectionManager) -> Arc<rustls::ServerConfig> {
+    let mut cert_data: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> = std::collections::HashMap::new();
+    for site in &CONFIG.sites {
+        let key = format!("nekoguard:cert:{}", site.domain);
+        let data: Result<Vec<u8>, _> = redis::cmd("GET").arg(&key).query_async(conn).await;
+        if let Ok(raw) = data {
+            if let Ok(c) = serde_json::from_slice::<CertData>(&raw) {
+                cert_data.insert(site.domain.clone(), (c.cert_pem.into_bytes(), c.key_pem.into_bytes()));
+            }
+        }
+    }
+
+    let cache_dir = std::env::temp_dir().join("nekoguard-certs");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    for (domain, (cert, key)) in &cert_data {
+        let _ = std::fs::write(cache_dir.join(format!("{domain}.crt")), cert);
+        let _ = std::fs::write(cache_dir.join(format!("{domain}.key")), key);
+        log::info!("[tls] loaded cert for {domain}");
+    }
+    let acme_state = rustls_acme::AcmeConfig::new(
+        CONFIG.sites.iter().map(|s| s.domain.clone()),
+    )
+    .cache(rustls_acme::caches::DirCache::new(cache_dir))
+    .state();
+    acme_state.default_rustls_config()
+}
+
 // Response helpers
 fn text_resp(status: StatusCode, body: &'static str) -> Response<RespBody> {
     Response::builder()
@@ -637,13 +680,50 @@ async fn main_inner() {
     );
     log::info!("[session] session manager ready");
 
-    let redis_conn = Arc::new(
-        tokio::sync::Mutex::new(
-            redis_client.get_connection_manager()
-                .await
-                .expect("failed to connect to Redis"),
-        ),
-    );
+    let redis_conn = Arc::new(tokio::sync::Mutex::new(
+        redis_client.get_connection_manager()
+            .await
+            .expect("failed to connect to Redis"),
+    ));
+
+    // Load TLS config from Redis certs
+    let tls_config = load_tls_config(&redis_conn).await;
+    let tls_config = Arc::new(arc_swap::ArcSwap::from_pointee(tls_config));
+
+    // Subscribe to Redis Pub/Sub for cert updates from certd
+    let tls_reload = tls_config.clone();
+    let redis_url_subscribe = CONFIG.redis_url.clone();
+    tokio::spawn(async move {
+        loop {
+            match redis::Client::open(redis_url_subscribe.as_str()) {
+                Ok(client) => {
+                    let pubsub = client.get_async_pubsub().await;
+                    match pubsub {
+                        Ok(mut ps) => {
+                            let _: () = ps.subscribe("nekoguard:cert:update").await
+                                .unwrap_or_default();
+                            log::info!("[tls] subscribed to cert updates");
+                            let mut stream = ps.on_message();
+                            while let Some(msg) = stream.next().await {
+                                let domain: String = msg.get_payload().unwrap_or_default();
+                                log::info!("[tls] cert update received for {domain} — reloading");
+                                let new_config = load_tls_config_raw(&redis_url_subscribe).await;
+                                tls_reload.store(Arc::new(new_config));
+                                log::info!("[tls] TLS config reloaded");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("[tls] redis pubsub failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("[tls] redis connect failed: {e}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 
     // Cleanup sweep: expire challenges and stale rate-limit buckets
     tokio::spawn(async {
@@ -731,45 +811,6 @@ async fn main_inner() {
     let listener = TcpListener::bind(addr).await.unwrap();
 
     // Load certs from Redis. All ACME operations are handled by
-    // nekoguard-certd — this binary just reads issued certs and
-    // serves them via TLS.
-    let default_rustls_config = {
-        let mut conn = redis_conn.lock().await;
-
-        // Collect all cert/key pairs from Redis
-        let mut cert_data: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> =
-            std::collections::HashMap::new();
-        for site in &CONFIG.sites {
-            let key = format!("nekoguard:cert:{}", site.domain);
-            let data: Result<Vec<u8>, _> = redis::cmd("GET").arg(&key).query_async(&mut *conn).await;
-            if let Ok(raw) = data {
-                if let Ok(c) = serde_json::from_slice::<CertData>(&raw) {
-                    cert_data.insert(site.domain.clone(), (c.cert_pem.into_bytes(), c.key_pem.into_bytes()));
-                }
-            }
-        }
-
-        // Load all certs into a single ServerConfig using rustls-acme's resolver
-        // which handles SNI-based cert selection automatically.
-        // Write certs to temp dir so AcmeConfig can load them into resolver.
-        let cache_dir = std::env::temp_dir().join("nekoguard-certs");
-        let _ = std::fs::create_dir_all(&cache_dir);
-        for (domain, (cert, key)) in &cert_data {
-            let _ = std::fs::write(cache_dir.join(format!("{domain}.crt")), cert);
-            let _ = std::fs::write(cache_dir.join(format!("{domain}.key")), key);
-            log::info!("[tls] loaded cert for {domain}");
-        }
-        let acme_state = rustls_acme::AcmeConfig::new(
-            CONFIG.sites.iter().map(|s| s.domain.clone()),
-        )
-        .cache(rustls_acme::caches::DirCache::new(cache_dir))
-        .state();
-        let config = acme_state.default_rustls_config();
-        config
-    };
-
-    let challenge_rustls_config = default_rustls_config.clone();
-
     log::info!(
         "NekoGuard :{port} TLS edge — {} site(s), {} permanent IP(s){}",
         CONFIG.sites.len(),
@@ -787,8 +828,7 @@ async fn main_inner() {
         };
         tcp.set_nodelay(true).ok();
         let peer_ip = peer.ip();
-        let challenge_rustls_config = challenge_rustls_config.clone();
-        let default_rustls_config = default_rustls_config.clone();
+        let tls_config = tls_config.clone();
         let client = Arc::clone(&client);
         let sess = Arc::clone(&sess);
         let redis_conn = Arc::clone(&redis_conn);
@@ -805,7 +845,8 @@ async fn main_inner() {
             // TLS-ALPN-01 validation requests are answered with the challenge
             // config and then closed; they never carry an HTTP request.
             if is_tls_alpn_challenge(&start_handshake.client_hello()) {
-                if let Ok(mut tls) = start_handshake.into_stream(challenge_rustls_config).await {
+                let current = (**tls_config.load()).clone();
+                if let Ok(mut tls) = start_handshake.into_stream(Arc::clone(&current)).await {
                     let _ = tls.shutdown().await;
                 }
                 return;
@@ -824,7 +865,8 @@ async fn main_inner() {
                 }
             }
 
-            let mut tls = match start_handshake.into_stream(default_rustls_config).await {
+            let current = (**tls_config.load()).clone();
+            let mut tls = match start_handshake.into_stream(Arc::clone(&current)).await {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("tls handshake: {e}");

@@ -168,6 +168,16 @@ async fn issue_or_renew(
         .await
         .expect("redis conn manager");
     store_cert(&mut redis, domain, &cert).await;
+
+    // Notify NekoGuard replicas via Redis Pub/Sub
+    let _: () = redis::cmd("PUBLISH")
+        .arg("nekoguard:cert:update")
+        .arg(domain)
+        .query_async(&mut redis)
+        .await
+        .ok()
+        .unwrap_or_default();
+
     log::info!("[certd] cert issued and stored for {domain}");
 }
 

@@ -35,6 +35,7 @@ log = "0.4.34"
 redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager"] }
 hmac = { version = "0.12", features = ["std"] }
 base64 = "0.23.1"
+arc-swap = "1.9.2"
 
 [build-dependencies]
 minify-html = "0.15"
