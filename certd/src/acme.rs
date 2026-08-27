@@ -37,6 +37,16 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
     let cache_dir = std::env::temp_dir().join("nekoguard-certd");
     std::fs::create_dir_all(&cache_dir).ok();
 
+    // Test HTTPS connectivity
+    log::info!("[certd] testing HTTPS connectivity to Let's Encrypt...");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    match client.get(LetsEncrypt::Production.url().to_owned()).send().await {
+        Ok(resp) => log::info!("[certd] Let's Encrypt reachable: HTTP {}", resp.status()),
+        Err(e) => log::error!("[certd] Let's Encrypt unreachable: {e}"),
+    }
+
     let cf_client = CloudflareDns::new(&CONFIG.certd.cloudflare_api_token);
 
     // Create or load ACME account
