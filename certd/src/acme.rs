@@ -23,10 +23,7 @@ pub async fn run_acme_loop(redis_url: &str, domains: &[String]) -> Result<(), Bo
     let cache_dir = std::env::temp_dir().join("nekoguard-certd");
     std::fs::create_dir_all(&cache_dir).ok();
 
-    let cf_client = CloudflareDns::new(
-        &CONFIG.certd.cloudflare_api_token,
-        &CONFIG.certd.cloudflare_zone_id,
-    );
+    let cf_client = CloudflareDns::new(&CONFIG.certd.cloudflare_api_token);
 
     // Create or load ACME account
     let creds_path = cache_dir.join("account_credentials.json");
@@ -119,7 +116,7 @@ async fn issue_or_renew(
             let dns_name = format!("_acme-challenge.{domain}");
 
             log::info!("[certd] setting DNS record: {dns_name} = {dns_value}");
-            cf.set_txt_record(&dns_name, &dns_value).await
+            cf.set_txt_record(domain, &dns_name, &dns_value).await
                 .expect("failed to set DNS record");
 
             challenge.set_ready().await.expect("challenge ready failed");
@@ -176,22 +173,58 @@ async fn issue_or_renew(
 struct CloudflareDns {
     client: reqwest::Client,
     api_token: String,
-    zone_id: String,
 }
 
 impl CloudflareDns {
-    fn new(api_token: &str, zone_id: &str) -> Self {
+    fn new(api_token: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_token: api_token.to_string(),
-            zone_id: zone_id.to_string(),
         }
     }
 
-    async fn set_txt_record(&self, name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// Look up the Cloudflare zone ID for a domain.
+    async fn get_zone_id(&self, domain: &str) -> Result<String, Box<dyn std::error::Error>> {
+        // Extract the root domain (e.g. "foo.bar.example.com" → "example.com")
+        let parts: Vec<&str> = domain.rsplitn(3, '.').collect();
+        let root_domain = if parts.len() >= 2 {
+            format!("{}.{}", parts[1], parts[0])
+        } else {
+            domain.to_string()
+        };
+
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones?name={}",
+            root_domain
+        );
+
+        let resp = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Cloudflare API error: {text}").into());
+        }
+
+        let data: serde_json::Value = resp.json().await?;
+        let zones = data["result"].as_array().ok_or("no zones found")?;
+        let zone_id = zones.first()
+            .and_then(|z| z["id"].as_str())
+            .ok_or("zone ID not found")?
+            .to_string();
+
+        log::info!("[certd] resolved zone for {domain}: {zone_id}");
+        Ok(zone_id)
+    }
+
+    async fn set_txt_record(&self, domain: &str, name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let zone_id = self.get_zone_id(domain).await?;
         let url = format!(
             "https://api.cloudflare.com/client/v4/zones/{}/dns_records",
-            self.zone_id
+            zone_id
         );
 
         let body = serde_json::json!({

@@ -35,7 +35,6 @@ pub struct CertdConfig {
     pub port: u16,
     pub contact_email: String,
     pub cloudflare_api_token: String,
-    pub cloudflare_zone_id: String,
     #[serde(default = "default_renewal_interval")]
     pub renewal_interval: u64,
 }

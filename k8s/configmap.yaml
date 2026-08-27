@@ -28,4 +28,3 @@ data:
     renewal_interval = 86400
     contact_email = ""
     cloudflare_api_token = ""
-    cloudflare_zone_id = ""

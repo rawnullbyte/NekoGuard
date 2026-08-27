@@ -115,7 +115,6 @@ port = 8443
 renewal_interval = 86400
 contact_email = "you@example.com"
 cloudflare_api_token = "your-cloudflare-api-token"
-cloudflare_zone_id = "your-zone-id"
 ```
 
 ### Path Bypass
