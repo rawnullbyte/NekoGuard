@@ -68,10 +68,11 @@ async fn main() {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    // Install rustls crypto provider before any TLS operations
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls crypto provider");
+    // Install rustls crypto provider before any TLS operations.
+    match rustls::crypto::ring::default_provider().install_default() {
+        Ok(()) => log::info!("[certd] rustls crypto provider installed"),
+        Err(_) => log::warn!("[certd] rustls crypto provider: already installed"),
+    }
 
     log::info!("nekoguard-certd starting on :{}", CONFIG.certd.port);
 
