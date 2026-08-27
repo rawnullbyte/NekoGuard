@@ -34,8 +34,9 @@ spec:
               memory: 256Mi
       volumes:
         - name: config
-          configMap:
-            name: nekoguard-config
+          hostPath:
+            path: /etc/nekoguard/nekoguard.toml
+            type: File
 ---
 apiVersion: v1
 kind: Service
