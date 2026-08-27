@@ -4,7 +4,6 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY nekoguard/ nekoguard/
 COPY certd/ certd/
-COPY instant-acme/ instant-acme/
 
 RUN cargo build --release --workspace
 
