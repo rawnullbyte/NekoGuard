@@ -189,8 +189,23 @@ impl rustls::server::ResolvesServerCert for TlsCertResolver {
         log::info!("[tls-resolver] looking up domain: {domain}");
 
         let certs = self.certs.read().ok()?;
-        log::info!("[tls-resolver] cert_map has {} entries: {:?}", certs.len(), certs.keys().collect::<Vec<_>>());
-        let (cert_chain, key_der) = certs.get(&domain)?;
+
+        // Try exact match first, then parent domains (e.g. git.nullbyte.rip → nullbyte.rip)
+        let (cert_chain, key_der) = if let Some(entry) = certs.get(&domain) {
+            entry
+        } else {
+            // Try stripping subdomains: foo.bar.example.com → bar.example.com → example.com
+            let parts: Vec<&str> = domain.split('.').collect();
+            let mut found = None;
+            for i in 1..parts.len() {
+                let parent = parts[i..].join(".");
+                if let Some(entry) = certs.get(&parent) {
+                    found = Some(entry);
+                    break;
+                }
+            }
+            found?
+        };
 
         let signing_key = rustls::crypto::ring::sign::any_supported_type(key_der).ok()?;
         let cert_key = rustls::sign::CertifiedKey::new(cert_chain.clone(), signing_key);
