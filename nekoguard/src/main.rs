@@ -568,7 +568,6 @@ async fn handle(
         // PoW valid — create a signed session cookie
         if let Some(ip) = real_ip {
             let cookie_val = session.create_cookie(ip);
-            log::info!("[session] VERIFY OK ip={ip} host={host_header} setting cookie={cookie_val}");
             let resp = text_resp(StatusCode::OK, "OK");
             let cookie_header = format!(
                 "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
@@ -606,12 +605,6 @@ async fn handle(
     let host = req.headers().get("host").and_then(|v| v.to_str().ok());
     let req_path = req.uri().path();
 
-    if !allowed && !path.starts_with("/__ng/") {
-        let raw_cookie = req.headers().get("cookie")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("(none)");
-        log::info!("[session] BLOCKED session_valid={session_valid} path={path} host={host_header} cookie={raw_cookie}");
-    }
     let bypass_match = host
         .and_then(|h| CONFIG.site_for_host(h))
         .and_then(|site| {

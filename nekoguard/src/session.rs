@@ -150,14 +150,15 @@ impl SessionManager {
         let expiry_hex = format!("{:x}", expiry);
         let nonce_hex = format!("{:x}", nonce);
 
-        let payload = format!("{ip_str}.{expiry_hex}.{nonce_hex}");
+        // Use '|' as separator — IPv4/IPv6 addresses contain '.' and ':'
+        let payload = format!("{ip_str}|{expiry_hex}|{nonce_hex}");
         let sig = self.sign(payload.as_bytes());
-        format!("{payload}.{sig}")
+        format!("{payload}|{sig}")
     }
 
     /// Verify a session cookie. Returns a Session on success.
     pub fn verify_cookie(&self, cookie_value: &str, peer_ip: IpAddr) -> Result<Session, SessionError> {
-        let parts: Vec<&str> = cookie_value.split('.').collect();
+        let parts: Vec<&str> = cookie_value.split('|').collect();
         if parts.len() != 4 {
             return Err(SessionError::Malformed);
         }
@@ -168,7 +169,7 @@ impl SessionManager {
         let sig_b64 = parts[3];
 
         // Verify signature
-        let payload = format!("{ip_str}.{expiry_hex}.{nonce_hex}");
+        let payload = format!("{ip_str}|{expiry_hex}|{nonce_hex}");
         if !self.verify(payload.as_bytes(), sig_b64) {
             return Err(SessionError::InvalidSignature);
         }
