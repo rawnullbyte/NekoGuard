@@ -570,7 +570,7 @@ async fn handle(
             let cookie_val = session.create_cookie(ip);
             let resp = text_resp(StatusCode::OK, "OK");
             let cookie_header = format!(
-                "{}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+                "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
                 session.cookie_name(), cookie_val, session.ttl().as_secs()
             );
             let mut resp = resp;
@@ -606,7 +606,10 @@ async fn handle(
     let req_path = req.uri().path();
 
     if !allowed && !path.starts_with("/__ng/") {
-        log::info!("[session] BLOCKED session_valid={session_valid} path={path} host={host_header}");
+        let raw_cookie = req.headers().get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("(none)");
+        log::info!("[session] BLOCKED session_valid={session_valid} path={path} host={host_header} cookie={raw_cookie}");
     }
     let bypass_match = host
         .and_then(|h| CONFIG.site_for_host(h))
