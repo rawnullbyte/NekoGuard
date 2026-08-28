@@ -5,6 +5,8 @@ metadata:
   namespace: nekoguard
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: nekoguard
@@ -15,6 +17,7 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 5
       containers:
         - name: nekoguard
           image: docker.io/library/nekoguard:latest
