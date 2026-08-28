@@ -119,8 +119,10 @@ impl AcmeClient {
             .build()?;
 
         // Generate P-256 key
-        use rand::rngs::OsRng;
-        let key = SigningKey::random(&mut OsRng);
+        // Generate P-256 key
+        let mut key_bytes = [0u8; 32];
+        getrandom::fill(&mut key_bytes).map_err(|e| format!("RNG error: {e}"))?;
+        let key = SigningKey::from_slice(&key_bytes).map_err(|e| format!("key error: {e}"))?;
         let thumbprint = jwk_thumbprint(&key);
 
         // Fetch directory

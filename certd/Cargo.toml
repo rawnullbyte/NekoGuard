@@ -23,5 +23,6 @@ rand = "0.10.2"
 rcgen = "0.14.9"
 http-body-util = "0.1.5"
 rand_core = "0.10.1"
+getrandom = "0.4.3"
 
 
