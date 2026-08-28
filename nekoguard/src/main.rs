@@ -363,6 +363,19 @@ async fn proxy_to_upstream(
             rp.headers.remove("content-security-policy-report-only");
             rp.headers.remove("transfer-encoding");
 
+            // Rewrite Location header: replace internal upstream address with public domain
+            // so browser redirects go through NekoGuard, not directly to upstream.
+            if let Some(loc) = rp.headers.get("location").and_then(|v| v.to_str().ok()) {
+                let rewritten = loc
+                    .replace(&format!("http://{up_authority}"), &format!("https://{public_host}"))
+                    .replace(&format!("https://{up_authority}"), &format!("https://{public_host}"));
+                if rewritten != loc {
+                    if let Ok(val) = HeaderValue::from_str(&rewritten) {
+                        rp.headers.insert("location", val);
+                    }
+                }
+            }
+
             let patched: Vec<HeaderValue> = rp
                 .headers
                 .get_all("set-cookie")
