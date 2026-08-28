@@ -568,6 +568,7 @@ async fn handle(
         // PoW valid — create a signed session cookie
         if let Some(ip) = real_ip {
             let cookie_val = session.create_cookie(ip);
+            log::info!("[session] VERIFY OK ip={ip} host={host_header} setting cookie={cookie_val}");
             let resp = text_resp(StatusCode::OK, "OK");
             let cookie_header = format!(
                 "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
