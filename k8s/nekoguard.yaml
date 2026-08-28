@@ -40,16 +40,6 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-          livenessProbe:
-            tcpSocket:
-              port: 443
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          readinessProbe:
-            tcpSocket:
-              port: 443
-            initialDelaySeconds: 5
-            periodSeconds: 5
       volumes:
         - name: config
           hostPath:
