@@ -570,7 +570,7 @@ async fn handle(
             let cookie_val = session.create_cookie(ip);
             let resp = text_resp(StatusCode::OK, "OK");
             let cookie_header = format!(
-                "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+                "{}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
                 session.cookie_name(), cookie_val, session.ttl().as_secs()
             );
             let mut resp = resp;
@@ -600,6 +600,9 @@ async fn handle(
 
     // Also allow permanent whitelist IPs
     let allowed = session_valid || real_ip.map(|ip| PERM.contains(&ip)).unwrap_or(false);
+    if !allowed && req_path != "/__ng/verify" {
+        log::debug!("[session] session_valid={session_valid} path={req_path} host={host_header:?}");
+    }
 
     // Path bypass: check site bypass, then catchall bypass as fallback.
     let host = req.headers().get("host").and_then(|v| v.to_str().ok());
