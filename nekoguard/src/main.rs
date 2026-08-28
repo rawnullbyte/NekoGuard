@@ -125,8 +125,15 @@ async fn build_tls_config(conn: &mut redis::aio::ConnectionManager) -> Arc<rustl
 
     let mut cert_map: std::collections::HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> = std::collections::HashMap::new();
 
-    for site in &CONFIG.sites {
-        let key = format!("nekoguard:cert:{}", site.domain);
+    // Load ALL certs from Redis (certd may issue for domains not in CONFIG.sites)
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("nekoguard:cert:*")
+        .query_async(conn)
+        .await
+        .unwrap_or_default();
+    for redis_key in &keys {
+        let domain = redis_key.strip_prefix("nekoguard:cert:").unwrap_or(redis_key);
+        let key = format!("nekoguard:cert:{domain}");
         let data: Result<Vec<u8>, _> = redis::cmd("GET").arg(&key).query_async(conn).await;
         if let Ok(raw) = data {
             if let Ok(c) = serde_json::from_slice::<CertData>(&raw) {
@@ -149,8 +156,8 @@ async fn build_tls_config(conn: &mut redis::aio::ConnectionManager) -> Arc<rustl
                 .next()
                 .expect("no private key found");
 
-                log::info!("[tls] loaded cert for {} ({} chain certs)", site.domain, certs.len());
-                cert_map.insert(site.domain.clone(), (certs, key_der));
+                log::info!("[tls] loaded cert for {domain} ({} chain certs)", certs.len());
+                cert_map.insert(domain.clone(), (certs, key_der));
             }
         }
     }
