@@ -1,14 +1,16 @@
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SECRET_KEY: &str = "nekoguard:secret";
 const SECRET_LEN: usize = 32;
+const NONCE_LEN: usize = 12;
 
-/// A validated session from a signed cookie.
+/// A validated session from a sealed cookie.
 #[derive(Debug, Clone)]
 pub struct Session {
     #[allow(dead_code)]
@@ -41,11 +43,19 @@ impl std::fmt::Display for SessionError {
     }
 }
 
-/// Manages signed session cookies using SHA-256 with HMAC-like keying.
-/// The signing secret is stored in Redis for cross-replica sharing.
+/// Payload sealed inside the cookie. The client never sees these fields.
+#[derive(Serialize, Deserialize)]
+struct SessionPayload {
+    ip: String,
+    exp: u64,
+}
+
+/// Manages sealed session cookies. The client sees one opaque base64url
+/// blob; only the server (holding the Redis AES-256 key) can read the
+/// IP and expiry inside. No field separators needed — no dot/colon bugs.
 #[allow(dead_code)]
 pub struct SessionManager {
-    secret: Vec<u8>,
+    key: [u8; 32],
     cookie_name: String,
     ttl: Duration,
 }
@@ -58,7 +68,7 @@ impl SessionManager {
         let mut conn = redis.get_multiplexed_async_connection().await.expect("redis connect");
         let secret = Self::get_or_create_secret(&mut conn).await;
         Self {
-            secret,
+            key: secret,
             cookie_name: "nekoguard_session".to_string(),
             ttl: Duration::from_secs(1800),
         }
@@ -73,23 +83,23 @@ impl SessionManager {
         let mut conn = redis.get_multiplexed_async_connection().await.expect("redis connect");
         let secret = Self::get_or_create_secret(&mut conn).await;
         Self {
-            secret,
+            key: secret,
             cookie_name: cookie_name.to_string(),
             ttl,
         }
     }
 
-    /// Get or create the signing secret in Redis.
-    async fn get_or_create_secret(conn: &mut redis::aio::MultiplexedConnection) -> Vec<u8> {
+    /// Get or create the 256-bit sealing key in Redis.
+    async fn get_or_create_secret(conn: &mut redis::aio::MultiplexedConnection) -> [u8; 32] {
         use rand::RngCore;
         let existing: Result<Vec<u8>, _> = redis::cmd("GET")
             .arg(SECRET_KEY)
             .query_async(conn)
             .await;
 
-        match existing {
+        let secret: Vec<u8> = match existing {
             Ok(secret) if !secret.is_empty() => {
-                log::debug!("[session] loaded signing secret from Redis");
+                log::debug!("[session] loaded sealing secret from Redis");
                 secret
             }
             _ => {
@@ -110,80 +120,78 @@ impl SessionManager {
                     .await
                     .expect("redis GET secret");
 
-                log::info!("[session] signing secret ready");
+                log::info!("[session] sealing secret ready");
                 final_secret
             }
-        }
-    }
-
-    /// Sign a message using HMAC-SHA256. Prevents length extension attacks
-    /// that plain SHA256(secret || message) is vulnerable to.
-    fn sign(&self, message: &[u8]) -> String {
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
-            .expect("HMAC accepts any key length");
-        mac.update(message);
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    }
-
-    /// Verify an HMAC signature against a message.
-    fn verify(&self, message: &[u8], sig_b64: &str) -> bool {
-        let sig_bytes = match URL_SAFE_NO_PAD.decode(sig_b64) {
-            Ok(b) => b,
-            Err(_) => return false,
         };
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
-            .expect("HMAC accepts any key length");
-        mac.update(message);
-        mac.verify_slice(&sig_bytes).is_ok()
+
+        let mut key = [0u8; 32];
+        let n = secret.len().min(32);
+        key[..n].copy_from_slice(&secret[..n]);
+        key
     }
 
-    /// Create a signed session cookie for the given IP.
+    fn cipher(&self) -> Aes256Gcm {
+        Aes256Gcm::new_from_slice(&self.key).expect("AES-256 accepts 32-byte key")
+    }
+
+    /// Create a sealed session cookie for the given IP.
     pub fn create_cookie(&self, ip: IpAddr) -> String {
-        let expiry = SystemTime::now()
+        let exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + self.ttl.as_secs();
 
-        let nonce: u64 = rand::random();
-        let ip_str = ip.to_string();
-        let expiry_hex = format!("{:x}", expiry);
-        let nonce_hex = format!("{:x}", nonce);
+        let payload = SessionPayload {
+            ip: ip.to_string(),
+            exp,
+        };
+        let plaintext = serde_json::to_vec(&payload).expect("serialize session");
 
-        // Use '|' as separator — IPv4/IPv6 addresses contain '.' and ':'
-        let payload = format!("{ip_str}|{expiry_hex}|{nonce_hex}");
-        let sig = self.sign(payload.as_bytes());
-        format!("{payload}|{sig}")
+        // Random 12-byte nonce prepended to ciphertext
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
+
+        let ciphertext = self.cipher()
+            .encrypt(&nonce, plaintext.as_ref())
+            .expect("encrypt session");
+
+        // blob = nonce || ciphertext (ciphertext includes the GCM tag)
+        let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        blob.extend_from_slice(&nonce_bytes);
+        blob.extend_from_slice(&ciphertext);
+
+        URL_SAFE_NO_PAD.encode(&blob)
     }
 
     /// Verify a session cookie. Returns a Session on success.
     pub fn verify_cookie(&self, cookie_value: &str, peer_ip: IpAddr) -> Result<Session, SessionError> {
-        let parts: Vec<&str> = cookie_value.split('|').collect();
-        if parts.len() != 4 {
+        let blob = URL_SAFE_NO_PAD.decode(cookie_value).map_err(|_| SessionError::Malformed)?;
+        if blob.len() <= NONCE_LEN {
             return Err(SessionError::Malformed);
         }
 
-        let ip_str = parts[0];
-        let expiry_hex = parts[1];
-        let nonce_hex = parts[2];
-        let sig_b64 = parts[3];
+        let nonce_bytes: [u8; NONCE_LEN] = blob[..NONCE_LEN]
+            .try_into()
+            .map_err(|_| SessionError::Malformed)?;
+        let nonce = Nonce::from(nonce_bytes);
+        let ciphertext = &blob[NONCE_LEN..];
 
-        // Verify signature
-        let payload = format!("{ip_str}|{expiry_hex}|{nonce_hex}");
-        if !self.verify(payload.as_bytes(), sig_b64) {
-            return Err(SessionError::InvalidSignature);
-        }
+        let plaintext = self.cipher()
+            .decrypt(&nonce, ciphertext)
+            .map_err(|_| SessionError::InvalidSignature)?;
 
-        // Check IP
-        let cookie_ip: IpAddr = ip_str.parse().map_err(|_| SessionError::Malformed)?;
+        let payload: SessionPayload =
+            serde_json::from_slice(&plaintext).map_err(|_| SessionError::Malformed)?;
+
+        let cookie_ip: IpAddr = payload.ip.parse().map_err(|_| SessionError::Malformed)?;
         if cookie_ip != peer_ip {
             return Err(SessionError::IpMismatch);
         }
 
-        // Check expiry
-        let expiry_secs: u64 = u64::from_str_radix(expiry_hex, 16).map_err(|_| SessionError::Malformed)?;
-        let expiry_time = UNIX_EPOCH + Duration::from_secs(expiry_secs);
-        if SystemTime::now() > expiry_time {
+        if SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() > payload.exp {
             return Err(SessionError::Expired);
         }
 
