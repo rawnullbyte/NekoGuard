@@ -157,6 +157,9 @@ async fn build_tls_config(conn: &mut redis::aio::ConnectionManager) -> Arc<rustl
                 .expect("no private key found");
 
                 log::info!("[tls] loaded cert for {domain} ({} chain certs)", certs.len());
+            } else {
+                log::warn!("[tls] failed to parse cert data for {domain}");
+            }
                 cert_map.insert(domain.to_string(), (certs, key_der));
             }
         }
@@ -184,8 +187,10 @@ impl rustls::server::ResolvesServerCert for TlsCertResolver {
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let domain = client_hello.server_name()?.to_string();
+        log::info!("[tls-resolver] looking up domain: {domain}");
 
         let certs = self.certs.read().ok()?;
+        log::info!("[tls-resolver] cert_map has {} entries: {:?}", certs.len(), certs.keys().collect::<Vec<_>>());
         let (cert_chain, key_der) = certs.get(&domain)?;
 
         let signing_key = rustls::crypto::ring::sign::any_supported_type(key_der).ok()?;
