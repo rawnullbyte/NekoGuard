@@ -601,7 +601,7 @@ async fn handle(
     // Also allow permanent whitelist IPs
     let allowed = session_valid || real_ip.map(|ip| PERM.contains(&ip)).unwrap_or(false);
     if !allowed && req_path != "/__ng/verify" {
-        log::debug!("[session] session_valid={session_valid} path={req_path} host={host_header:?}");
+        log::debug!("[session] session_valid={session_valid} path={path} host={host_header:?}");
     }
 
     // Path bypass: check site bypass, then catchall bypass as fallback.
