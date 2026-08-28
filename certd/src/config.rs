@@ -29,6 +29,9 @@ pub struct SiteToml {
     pub upstream: String,
     #[serde(default)]
     bypass: Vec<String>,
+    /// Issue wildcard cert (*.domain) in addition to the base domain
+    #[serde(default)]
+    pub wildcard: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

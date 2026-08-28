@@ -248,119 +248,81 @@ impl AcmeClient {
 
     async fn issue_cert(
         &mut self,
-        domain: &str,
+        domains: &[String],
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        let primary = &domains[0];
+        log::info!("[acme] creating order for {:?}", domains);
+
         // Step 1: New order
-        log::info!("[acme] creating order for {domain}");
-        let order_payload = serde_json::json!({
-            "identifiers": [{"type": "dns", "value": domain}]
-        });
-        let url = self.directory.newOrder.clone();
-        let resp = self
-            .post_jws(
-                &url,
-                serde_json::to_vec(&order_payload)?.as_slice(),
-                false,
-            )
-            .await?;
-
-        // Capture order URL from Location header before consuming response
-        let order_url = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let order: serde_json::Value = resp.json().await?;
-        let auth_url = order["authorizations"][0]
-            .as_str()
-            .ok_or("no authorizations")?
-            .to_string();
-        let finalize_url = order["finalize"]
-            .as_str()
-            .ok_or("no finalize URL")?
-            .to_string();
-
-        // Step 2: Get authorization → find dns-01 challenge
-        log::info!("[acme] fetching authorization");
-        let auth_resp = self.post_as_get(&auth_url).await?;
-        let auth: serde_json::Value = auth_resp.json().await?;
-
-        let challenge = auth["challenges"]
-            .as_array()
-            .ok_or("no challenges")?
+        let identifiers: Vec<serde_json::Value> = domains
             .iter()
-            .find(|c| c["type"] == "dns-01")
-            .ok_or("no dns-01 challenge")?;
+            .map(|d| serde_json::json!({"type": "dns", "value": d}))
+            .collect();
+        let order_payload = serde_json::json!({ "identifiers": identifiers });
+        let url = self.directory.newOrder.clone();
+        let resp = self.post_jws(&url, serde_json::to_vec(&order_payload)?.as_slice(), false).await?;
 
-        let token = challenge["token"]
-            .as_str()
-            .ok_or("no challenge token")?
-            .to_string();
-        let challenge_url = challenge["url"]
-            .as_str()
-            .ok_or("no challenge url")?
-            .to_string();
+        let order_url = resp.headers().get("location")
+            .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let order: serde_json::Value = resp.json().await?;
+        let finalize_url = order["finalize"].as_str().ok_or("no finalize URL")?.to_string();
 
-        // Step 3: Compute DNS-01 challenge value
-        let key_auth = format!("{token}.{}", self.thumbprint);
-        let txt_value = b64(&Sha256::digest(key_auth.as_bytes()));
-        log::info!("[acme] token: {token}");
-        log::info!("[acme] thumbprint: {}", self.thumbprint);
-        log::info!("[acme] key_auth: {key_auth}");
-        log::info!("[acme] txt_value: {txt_value}");
-        log::info!("[acme] set TXT _acme-challenge.{domain} = {txt_value}");
+        // Step 2: Process ALL authorizations (one per domain)
+        let auth_urls: Vec<String> = order["authorizations"]
+            .as_array().ok_or("no authorizations")?
+            .iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
 
-        // Step 4: Set DNS record via Cloudflare
-        set_cloudflare_txt(domain, &txt_value).await?;
+        for auth_url in &auth_urls {
+            let auth_resp = self.post_as_get(auth_url).await?;
+            let auth: serde_json::Value = auth_resp.json().await?;
+            let auth_domain = auth["identifier"]["value"].as_str().unwrap_or("unknown");
 
-        // Step 5: Wait for DNS propagation (Cloudflare can take 60s+)
+            let challenge = auth["challenges"].as_array().ok_or("no challenges")?
+                .iter().find(|c| c["type"] == "dns-01")
+                .ok_or("no dns-01 challenge")?;
+            let token = challenge["token"].as_str().ok_or("no token")?.to_string();
+            let challenge_url = challenge["url"].as_str().ok_or("no challenge url")?.to_string();
+
+            let key_auth = format!("{token}.{}", self.thumbprint);
+            let txt_value = b64(&Sha256::digest(key_auth.as_bytes()));
+
+            // For wildcards like *.example.com, TXT goes on _acme-challenge.example.com
+            let dns_name = auth_domain.strip_prefix("*.").unwrap_or(auth_domain);
+            log::info!("[acme] set TXT _acme-challenge.{dns_name} = {txt_value}");
+            set_cloudflare_txt(dns_name, &txt_value).await?;
+
+            let resp = self.post_jws(&challenge_url, b"{}", false).await?;
+            log::info!("[acme] challenge {auth_domain}: {}", resp.status());
+        }
+
+        // Step 3: Wait for DNS propagation
         log::info!("[acme] waiting 30s for DNS propagation...");
         tokio::time::sleep(Duration::from_secs(30)).await;
 
-        // Step 6: Respond to challenge
-        log::info!("[acme] responding to challenge");
-        let resp = self
-            .post_jws(challenge_url.as_str(), b"{}", false)
-            .await?;
-        log::info!(
-            "[acme] challenge response: {}",
-            resp.status()
-        );
-
-        // Step 7: Poll order until ready
+        // Step 4: Poll order until ready
         log::info!("[acme] polling order status...");
-        let poll_url = order_url.clone();
         for attempt in 0..30 {
-            let resp = self.post_as_get(&poll_url).await?;
+            let resp = self.post_as_get(&order_url).await?;
             let status: serde_json::Value = resp.json().await?;
             let state = status["status"].as_str().unwrap_or("");
             log::info!("[acme] order status: {state} (attempt {attempt})");
-
             match state {
-                "ready" => break,
-                "valid" => break,
-                "invalid" => {
-                    return Err(format!("order invalid: {status}").into());
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
+                "ready" | "valid" => break,
+                "invalid" => return Err(format!("order invalid: {status}").into()),
+                _ => { tokio::time::sleep(Duration::from_secs(5)).await; }
             }
         }
 
-        // Step 8: Finalize with CSR
-        log::info!("[acme] finalizing order with CSR");
+        // Step 5: Finalize with multi-SAN CSR
+        log::info!("[acme] finalizing order with CSR for {:?}", domains);
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
-        // Set CN to domain (rcgen defaults to "rcgen self signed cert")
+        let mut params = rcgen::CertificateParams::new(domains.to_vec())?;
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, domain);
+        params.distinguished_name.push(rcgen::DnType::CommonName, primary.as_str());
         let csr = params.serialize_request(&key_pair)?;
         let csr_der = csr.der().to_vec();
         let key_pem = key_pair.serialize_pem();
-        log::info!("[acme] CSR DER size: {} bytes", csr_der.len());
+        log::info!("[acme] CSR DER size: {} bytes, domains: {:?}", csr_der.len(), domains);
         let csr_b64 = b64(&csr_der);
 
         let finalize_payload = serde_json::json!({ "csr": csr_b64 });
@@ -543,7 +505,12 @@ pub async fn run_acme_loop(
 
     // Issue certs for all domains
     for domain in domains {
-        match client.issue_cert(domain).await {
+        // Group parent + wildcard domains for cert issuance
+        let mut cert_domains = vec![domain.clone()];
+        if let Some(wildcard) = domains.iter().find(|d| d.starts_with("*.") && d.ends_with(&domain[1..])) {
+            cert_domains.push(wildcard.clone());
+        }
+        match client.issue_cert(&cert_domains).await {
             Ok((cert_pem, key_pem)) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
@@ -591,7 +558,11 @@ pub async fn run_acme_loop(
                     .as_secs();
                 if cert.expires_at > 0 && cert.expires_at < now + 30 * 86400 {
                     log::info!("[certd] renewing cert for {domain}");
-                    match client.issue_cert(domain).await {
+                    let mut cert_domains = vec![domain.clone()];
+                    if let Some(wildcard) = domains.iter().find(|d| d.starts_with("*.") && d.ends_with(&domain[1..])) {
+                        cert_domains.push(wildcard.clone());
+                    }
+                    match client.issue_cert(&cert_domains).await {
                         Ok((cert_pem, key_pem)) => {
                             let new_cert = CertData {
                                 cert_pem,

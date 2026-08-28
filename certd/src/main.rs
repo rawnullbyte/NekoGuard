@@ -77,7 +77,13 @@ async fn main() {
     log::info!("nekoguard-certd starting on :{}", CONFIG.certd.port);
 
     // Start ACME issuance/renewal loop in background
-    let domains: Vec<String> = CONFIG.sites.iter().map(|s| s.domain.clone()).collect();
+    let mut domains: Vec<String> = Vec::new();
+    for site in &CONFIG.sites {
+        domains.push(site.domain.clone());
+        if site.wildcard {
+            domains.push(format!("*.{}", site.domain));
+        }
+    }
     let redis_url = CONFIG.redis.url.clone();
     tokio::spawn(async move {
         let _ = acme::run_acme_loop(&redis_url, &domains).await;
