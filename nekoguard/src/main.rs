@@ -119,30 +119,73 @@ async fn load_tls_config_raw(redis_url: &str) -> Arc<rustls::ServerConfig> {
 }
 
 async fn build_tls_config(conn: &mut redis::aio::ConnectionManager) -> Arc<rustls::ServerConfig> {
-    let mut cert_data: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> = std::collections::HashMap::new();
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::Arc;
+
+    let mut cert_map: std::collections::HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> = std::collections::HashMap::new();
+
     for site in &CONFIG.sites {
         let key = format!("nekoguard:cert:{}", site.domain);
         let data: Result<Vec<u8>, _> = redis::cmd("GET").arg(&key).query_async(conn).await;
         if let Ok(raw) = data {
             if let Ok(c) = serde_json::from_slice::<CertData>(&raw) {
-                cert_data.insert(site.domain.clone(), (c.cert_pem.into_bytes(), c.key_pem.into_bytes()));
+                // Parse cert chain (PEM)
+                let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(
+                    c.cert_pem.as_bytes(),
+                )
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to parse cert PEM")
+                .into_iter()
+                .collect();
+
+                // Parse private key (PEM)
+                let key_der = PrivateKeyDer::pem_slice_iter(
+                    c.key_pem.as_bytes(),
+                )
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to parse key PEM")
+                .into_iter()
+                .next()
+                .expect("no private key found");
+
+                log::info!("[tls] loaded cert for {} ({} chain certs)", site.domain, certs.len());
+                cert_map.insert(site.domain.clone(), (certs, key_der));
             }
         }
     }
 
-    let cache_dir = std::env::temp_dir().join("nekoguard-certs");
-    let _ = std::fs::create_dir_all(&cache_dir);
-    for (domain, (cert, key)) in &cert_data {
-        let _ = std::fs::write(cache_dir.join(format!("{domain}.crt")), cert);
-        let _ = std::fs::write(cache_dir.join(format!("{domain}.key")), key);
-        log::info!("[tls] loaded cert for {domain}");
+    // Build a resolve_server_cert callback that matches by SNI
+    let certs = Arc::new(std::sync::RwLock::new(cert_map));
+    let certs_clone = certs.clone();
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(TlsCertResolver { certs: certs_clone }));
+
+    Arc::new(config)
+}
+
+#[derive(Debug)]
+struct TlsCertResolver {
+    certs: Arc<std::sync::RwLock<std::collections::HashMap<String, (Vec<rustls_pki_types::CertificateDer<'static>>, rustls_pki_types::PrivateKeyDer<'static>)>>>,
+}
+
+impl rustls::server::ResolvesServerCert for TlsCertResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let domain = client_hello.server_name()?.to_string();
+
+        let certs = self.certs.read().ok()?;
+        let (cert_chain, key_der) = certs.get(&domain)?;
+
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(key_der).ok()?;
+        let cert_key = rustls::sign::CertifiedKey::new(cert_chain.clone(), signing_key);
+
+        Some(Arc::new(cert_key))
     }
-    let acme_state = rustls_acme::AcmeConfig::new(
-        CONFIG.sites.iter().map(|s| s.domain.clone()),
-    )
-    .cache(rustls_acme::caches::DirCache::new(cache_dir))
-    .state();
-    acme_state.default_rustls_config()
 }
 
 // Response helpers
