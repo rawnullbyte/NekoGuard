@@ -269,37 +269,52 @@ impl AcmeClient {
         let order: serde_json::Value = resp.json().await?;
         let finalize_url = order["finalize"].as_str().ok_or("no finalize URL")?.to_string();
 
-        // Step 2: Process ALL authorizations (one per domain)
+        // Step 2: Process ALL authorizations — collect TXT values, then set all at once
         let auth_urls: Vec<String> = order["authorizations"]
             .as_array().ok_or("no authorizations")?
             .iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
 
+        // First pass: fetch all authorizations, compute TXT values, collect challenge URLs
+        struct ChallengeInfo { dns_name: String, txt_value: String, challenge_url: String, auth_domain: String }
+        let mut challenges: Vec<ChallengeInfo> = Vec::new();
+        let mut txt_per_dns: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
         for auth_url in &auth_urls {
             let auth_resp = self.post_as_get(auth_url).await?;
             let auth: serde_json::Value = auth_resp.json().await?;
-            let auth_domain = auth["identifier"]["value"].as_str().unwrap_or("unknown");
+            let auth_domain = auth["identifier"]["value"].as_str().unwrap_or("unknown").to_string();
 
-            let challenge = auth["challenges"].as_array().ok_or("no challenges")?
+            let ch = auth["challenges"].as_array().ok_or("no challenges")?
                 .iter().find(|c| c["type"] == "dns-01")
                 .ok_or("no dns-01 challenge")?;
-            let token = challenge["token"].as_str().ok_or("no token")?.to_string();
-            let challenge_url = challenge["url"].as_str().ok_or("no challenge url")?.to_string();
+            let token = ch["token"].as_str().ok_or("no token")?.to_string();
+            let challenge_url = ch["url"].as_str().ok_or("no challenge url")?.to_string();
 
             let key_auth = format!("{token}.{}", self.thumbprint);
             let txt_value = b64(&Sha256::digest(key_auth.as_bytes()));
 
-            // For wildcards like *.example.com, TXT goes on _acme-challenge.example.com
-            let dns_name = auth_domain.strip_prefix("*.").unwrap_or(auth_domain);
-            log::info!("[acme] set TXT _acme-challenge.{dns_name} = {txt_value}");
-            set_cloudflare_txt(dns_name, &txt_value).await?;
-
-            let resp = self.post_jws(&challenge_url, b"{}", false).await?;
-            log::info!("[acme] challenge {auth_domain}: {}", resp.status());
+            // For wildcards, TXT goes on parent domain's _acme-challenge
+            let dns_name = auth_domain.strip_prefix("*.").unwrap_or(&auth_domain).to_string();
+            txt_per_dns.entry(dns_name.clone()).or_default().push(txt_value.clone());
+            challenges.push(ChallengeInfo { dns_name, txt_value, challenge_url, auth_domain });
         }
 
-        // Step 3: Wait for DNS propagation
+        // Set ALL TXT records at once (multiple values per name for wildcard + base)
+        for (dns_name, values) in &txt_per_dns {
+            log::info!("[acme] set TXT _acme-challenge.{dns_name} = {:?}", values);
+            set_cloudflare_txt(dns_name, values).await?;
+        }
+
+        // Wait for DNS propagation
         log::info!("[acme] waiting 30s for DNS propagation...");
         tokio::time::sleep(Duration::from_secs(30)).await;
+
+        // Second pass: respond to all challenges
+        for ch in &challenges {
+            log::info!("[acme] responding to challenge for {}", ch.auth_domain);
+            let resp = self.post_jws(&ch.challenge_url, b"{}", false).await?;
+            log::info!("[acme] challenge {}: {}", ch.auth_domain, resp.status());
+        }
 
         // Step 4: Poll order until ready
         log::info!("[acme] polling order status...");
@@ -396,7 +411,7 @@ async fn resolve_zone_id(
 
 async fn set_cloudflare_txt(
     domain: &str,
-    value: &str,
+    values: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let http = reqwest::Client::new();
     let token = &CONFIG.certd.cloudflare_api_token;
@@ -431,24 +446,26 @@ async fn set_cloudflare_txt(
         }
     }
 
-    // Create new TXT record
-    let body = serde_json::json!({
-        "type": "TXT",
-        "name": dns_name,
-        "content": value,
-        "ttl": 120,
-    });
-    let resp = http
-        .post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    // Create TXT records (one per value — wildcard + base use different values on same name)
+    for value in values {
+        let body = serde_json::json!({
+            "type": "TXT",
+            "name": dns_name,
+            "content": value,
+            "ttl": 120,
+        });
+        let resp = http
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
 
-    if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Cloudflare DNS error: {text}").into());
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Cloudflare DNS error: {text}").into());
+        }
     }
     Ok(())
 }
