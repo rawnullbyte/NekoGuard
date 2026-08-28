@@ -29,9 +29,19 @@ pub struct SiteToml {
     pub upstream: String,
     #[serde(default)]
     bypass: Vec<String>,
-    /// Issue wildcard cert (*.domain) in addition to the base domain
     #[serde(default)]
-    pub wildcard: bool,
+    pub sub: Vec<SubSiteToml>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubSiteToml {
+    pub name: String,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub bypass: Option<Vec<String>>,
+    #[serde(default)]
+    pub rate_limit: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

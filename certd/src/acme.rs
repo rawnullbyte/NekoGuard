@@ -119,7 +119,7 @@ impl AcmeClient {
             .build()?;
 
         // Generate P-256 key
-        use rand_core::OsRng;
+        use rand::rngs::OsRng;
         let key = SigningKey::random(&mut OsRng);
         let thumbprint = jwk_thumbprint(&key);
 

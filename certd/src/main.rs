@@ -80,7 +80,8 @@ async fn main() {
     let mut domains: Vec<String> = Vec::new();
     for site in &CONFIG.sites {
         domains.push(site.domain.clone());
-        if site.wildcard {
+        // Auto-add wildcard cert if site has subdomains
+        if !site.sub.is_empty() {
             domains.push(format!("*.{}", site.domain));
         }
     }
