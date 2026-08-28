@@ -523,11 +523,19 @@ pub async fn run_acme_loop(
     let mut client = AcmeClient::new(&CONFIG.certd.contact_email).await?;
 
     // Issue certs for all domains
-    for domain in domains {
-        // Group parent + wildcard domains for cert issuance
+    // Build cert groups: pair each base domain with its wildcard if present
+    let wildcards: std::collections::HashSet<String> = domains.iter()
+        .filter(|d| d.starts_with("*."))
+        .cloned().collect();
+    let base_domains: Vec<String> = domains.iter()
+        .filter(|d| !d.starts_with("*."))
+        .cloned().collect();
+
+    for domain in &base_domains {
         let mut cert_domains = vec![domain.clone()];
-        if let Some(wildcard) = domains.iter().find(|d| d.starts_with("*.") && d.ends_with(&domain[1..])) {
-            cert_domains.push(wildcard.clone());
+        let wildcard = format!("*.{domain}");
+        if wildcards.contains(&wildcard) {
+            cert_domains.push(wildcard);
         }
         match client.issue_cert(&cert_domains).await {
             Ok((cert_pem, key_pem)) => {
@@ -578,8 +586,9 @@ pub async fn run_acme_loop(
                 if cert.expires_at > 0 && cert.expires_at < now + 30 * 86400 {
                     log::info!("[certd] renewing cert for {domain}");
                     let mut cert_domains = vec![domain.clone()];
-                    if let Some(wildcard) = domains.iter().find(|d| d.starts_with("*.") && d.ends_with(&domain[1..])) {
-                        cert_domains.push(wildcard.clone());
+                    let wildcard = format!("*.{domain}");
+                    if domains.contains(&wildcard) {
+                        cert_domains.push(wildcard);
                     }
                     match client.issue_cert(&cert_domains).await {
                         Ok((cert_pem, key_pem)) => {
