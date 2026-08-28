@@ -157,10 +157,9 @@ async fn build_tls_config(conn: &mut redis::aio::ConnectionManager) -> Arc<rustl
                 .expect("no private key found");
 
                 log::info!("[tls] loaded cert for {domain} ({} chain certs)", certs.len());
+                cert_map.insert(domain.to_string(), (certs, key_der));
             } else {
                 log::warn!("[tls] failed to parse cert data for {domain}");
-            }
-                cert_map.insert(domain.to_string(), (certs, key_der));
             }
         }
     }
