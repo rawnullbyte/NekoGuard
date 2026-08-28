@@ -359,6 +359,7 @@ impl AcmeClient {
         params.distinguished_name.push(rcgen::DnType::CommonName, domain);
         let csr = params.serialize_request(&key_pair)?;
         let csr_der = csr.der().to_vec();
+        let key_pem = key_pair.serialize_pem();
         log::info!("[acme] CSR DER size: {} bytes", csr_der.len());
         let csr_b64 = b64(&csr_der);
 
@@ -387,10 +388,6 @@ impl AcmeClient {
             if resp.status() == 200 {
                 let cert_pem = resp.text().await?;
                 log::info!("[acme] certificate issued for {domain}");
-
-                // Generate private key PEM
-                let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-                let key_pem = key_pair.serialize_pem();
 
                 return Ok((cert_pem, key_pem));
             }
