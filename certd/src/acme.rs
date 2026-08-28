@@ -119,7 +119,7 @@ impl AcmeClient {
             .build()?;
 
         // Generate P-256 key
-        use p256::elliptic_curve::rand_core::OsRng;
+        use rand_core::OsRng;
         let key = SigningKey::random(&mut OsRng);
         let thumbprint = jwk_thumbprint(&key);
 
@@ -349,7 +349,7 @@ impl AcmeClient {
             let resp = self.post_as_get(&cert_url).await?;
             if resp.status() == 200 {
                 let cert_pem = resp.text().await?;
-                log::info!("[acme] certificate issued for {domain}");
+                log::info!("[acme] certificate issued for {primary}");
 
                 return Ok((cert_pem, key_pem));
             }
