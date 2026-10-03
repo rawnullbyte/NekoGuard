@@ -92,12 +92,16 @@ struct Cached {
 static CACHE: LazyLock<Mutex<HashMap<String, Arc<Mutex<Option<Cached>>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// The favicon link the interstitial advertises when the origin has an icon;
+/// it maps back to this host's own `/__ng/favicon.ico`.
+const FAVICON_LINK: &str = r#"<link rel="icon" href="/__ng/favicon.ico">"#;
+
 /// Splice the origin's metadata into a rendered interstitial page: the
 /// origin's title, its descriptive `<meta>` tags in place of `{{NG_META}}`,
 /// and a favicon link when the origin has one.
 ///
-/// A page with no `{{NG_META}}` marker is returned with only its title
-/// replaced, so the interstitial still renders if the marker is ever lost.
+/// This owns the `{{NG_META}}` marker and clears it unconditionally, so the
+/// template can never leak the marker into a served page.
 pub(crate) async fn inline_into(
     page: String,
     client: &ProxyClient,
@@ -105,23 +109,31 @@ pub(crate) async fn inline_into(
     upstream: &str,
 ) -> String {
     let host = normalize_host(host);
-
-    // A page with no usable <title> renders as a blank link, so fall back to
-    // the bare host rather than to the placeholder's title.
-    let Some(meta) = load(&host, client, upstream).await else {
-        return replace_title(&page, &host);
-    };
+    let meta = load(&host, client, upstream).await;
 
     let mut inject = String::new();
-    for tag in &meta.tags {
-        inject.push_str(tag);
+    if let Some(meta) = &meta {
+        for tag in &meta.tags {
+            inject.push_str(tag);
+        }
+        if meta.icon.is_some() {
+            inject.push_str(FAVICON_LINK);
+        }
     }
-    if meta.icon.is_some() {
-        inject.push_str(r#"<link rel="icon" href="/__ng/favicon.ico">"#);
-    }
-    let title = meta.title.clone().unwrap_or_else(|| host.clone());
+
+    // A missing title renders as a blank link, so fall back to the bare host
+    // rather than to the placeholder's own title.
+    let title = meta
+        .and_then(|meta| meta.title.clone())
+        .unwrap_or_else(|| host.clone());
 
     replace_title(&page, &title).replacen("{{NG_META}}", &inject, 1)
+}
+
+/// Clear the `{{NG_META}}` marker from a page that was rendered without the
+/// origin metadata, so it never reaches a client.
+pub(crate) fn clear_marker(page: String) -> String {
+    page.replace("{{NG_META}}", "")
 }
 
 /// The origin's favicon, for the interstitial to advertise as
@@ -421,10 +433,11 @@ fn render_tag(meta: &mut Meta, tag: &str) {
         return;
     }
 
-    // NekoGuard answers canonical links itself, pointing at the protected
-    // origin; the origin's own value would name an address the embedder can't
-    // reach.
-    if lower == "og:url" {
+    // A URL the origin declares about itself can't be trusted to name the
+    // public address — an origin configured with an internal hostname will
+    // publish that. NekoGuard answers canonical links itself, via the
+    // `Link: …; rel="canonical"` header.
+    if lower == "og:url" || lower == "twitter:url" {
         return;
     }
     // The origin's own card type is usually too small for the embed it lands
@@ -434,10 +447,13 @@ fn render_tag(meta: &mut Meta, tag: &str) {
         return;
     }
 
+    // Decode before escaping: origins write plain characters as entities
+    // (`&#x27;` for an apostrophe), and escaping without decoding first would
+    // publish that entity as visible text.
     meta.tags.push(format!(
         r#"<meta {key}="{}" content="{}">"#,
-        html_escape(value),
-        html_escape(content)
+        html_escape(&decode(value)),
+        html_escape(&decode(content))
     ));
 }
 
@@ -531,14 +547,55 @@ fn decode_data_uri(rest: &str) -> Option<(Bytes, &'static str)> {
     Some((Bytes::from(decoded), mime))
 }
 
+/// Resolve character references in a scraped value, one pass left to right.
+///
+/// Origins routinely write plain apostrophes as `&#x27;`, and a value that is
+/// escaped without being decoded first would carry that straight through into
+/// an embed as visible `&#x27;` text. Single-pass is what keeps a literal
+/// `&amp;#x27;` (an escaped entity the author meant to display) intact.
 fn decode(html: &str) -> String {
-    let escaped = html
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
-    // `&amp;` last so "&amp;lt;" doesn't come out as "<".
-    escaped.replace("&amp;", "&")
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp + 1..];
+        // Entities are short; a `;` further out than this isn't one, so a
+        // stray `&` in prose can't swallow the text after it.
+        let entity = tail.find(';').filter(|end| *end <= 8).map(|end| &tail[..end]);
+
+        match entity.and_then(decode_entity) {
+            Some(decoded) => {
+                out.push(decoded);
+                rest = &tail[entity.unwrap().len() + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{a0}'),
+        // Numeric: `&#x27;` and `&#39;` are the same character.
+        _ => char::from_u32(
+            entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|dec| dec.parse().ok()))?,
+        ),
+    }
 }
 
 fn html_escape(value: &str) -> String {
@@ -628,9 +685,32 @@ mod tests {
             r#"<meta property="og:title" content="x&quot;><script>alert(1)</script>">"#,
         );
         assert_eq!(meta.tags.len(), 1);
-        assert!(!meta.tags[0].contains("<script>"), "raw markup survived: {}", meta.tags[0]);
-        // The entity is inert text, so it is escaped rather than decoded.
-        assert!(meta.tags[0].contains("&amp;quot;&gt;&lt;script&gt;"), "{}", meta.tags[0]);
+        let tag = &meta.tags[0];
+
+        // Decoding `&quot;` and then escaping restores `&quot;`, so the value
+        // stays inside its attribute — the part after it never becomes a new
+        // attribute.
+        assert!(!tag.contains(r#"x" onload"#), "broke out of the attribute: {tag}");
+        // `<script>` from `&lt;script&gt;` round-trips to the same entity, so
+        // it can never become markup.
+        assert!(!tag.contains("<script>"), "raw markup survived: {tag}");
+        assert!(tag.contains("&lt;script&gt;"), "{tag}");
+        // No raw metacharacter may appear in the emitted tag's value.
+        let value = &tag[tag.find("content=").unwrap()..];
+        assert!(!value.contains('"') || value.matches('"').count() == 2, "{tag}");
+    }
+
+    #[test]
+    fn urls_the_origin_declares_are_dropped() {
+        let mut meta = Meta::default();
+        render_tag(&mut meta, r#"<meta property="og:url" content="http://10.0.0.5:2368/">"#);
+        render_tag(&mut meta, r#"<meta name="twitter:url" content="http://10.0.0.5:2368/">"#);
+        assert!(meta.tags.is_empty(), "an origin-declared URL leaked: {:?}", meta.tags);
+
+        // Matching is exact, so a prefixed sibling like `og:image:url` — which
+        // is a legitimate property — survives.
+        render_tag(&mut meta, r#"<meta property="og:image:url" content="/share.png">"#);
+        assert_eq!(meta.tags.len(), 1, "{:?}", meta.tags);
     }
 
     #[test]
@@ -666,6 +746,29 @@ mod tests {
         assert_eq!(meta.icon_url.as_deref(), Some("/favicon.ico"));
     }
 
+    /// Metadata is only lifted from a document the origin actually declares as
+    /// HTML — a JSON API or an image sitting at `/` must never be parsed as
+    /// markup.
+    #[test]
+    fn is_html_admits_only_html_media_types() {
+        let h = |s: &str| is_html(Some(&HeaderValue::from_str(s).unwrap()));
+
+        assert!(h("text/html"));
+        assert!(h("text/html; charset=utf-8"));
+        assert!(h("TEXT/HTML; CHARSET=UTF-8"));
+        assert!(h("  text/html  "));
+        assert!(h("application/xhtml+xml"));
+
+        assert!(!h("application/json"));
+        assert!(!h("text/plain"));
+        assert!(!h("application/xml"));
+        assert!(!h("image/png"));
+        assert!(!h("image/svg+xml"));
+        assert!(!h(""));
+        // Absent content type: nothing to vouch for it, so refuse.
+        assert!(!is_html(None));
+    }
+
     #[test]
     fn icon_mime_admits_raster_only() {
         assert_eq!(icon_mime("image/png"), Some("image/png"));
@@ -689,8 +792,62 @@ mod tests {
     #[test]
     fn entity_decoding_is_applied_once() {
         assert_eq!(decode("Ben &amp; Jerry"), "Ben & Jerry");
+        // A literal "&amp;lt;" is an author writing "&lt;", not markup.
         assert_eq!(decode("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
         assert_eq!(decode("a &lt;b&gt; c"), "a <b> c");
+        // The form Ghost writes apostrophes in, seen on a live origin.
+        assert_eq!(
+            decode("We&#x27;re an independent group"),
+            "We're an independent group"
+        );
+        assert_eq!(decode("&#39;"), "'");
+        assert_eq!(decode("&#8212;"), "\u{2014}");
+        // A bare ampersand in prose must not eat the following text.
+        assert_eq!(decode("Tom & Jerry & Co."), "Tom & Jerry & Co.");
+        assert_eq!(decode("5 &lt; 6 & 7"), "5 < 6 & 7");
+        assert_eq!(decode("&notanentity; &"), "&notanentity; &");
+    }
+
+    /// The page shape that shipped broken: `main.rs` cleared the marker and
+    /// `inline_into` then tried to fill it, so nothing was ever injected.
+    #[test]
+    fn marker_is_filled_even_though_the_template_carries_it() {
+        let page = "<html><head><title>Verifying your connection</title>{{NG_META}}</head></html>";
+        let mut meta = Meta::default();
+        render_tag(&mut meta, r#"<meta name="description" content="desc">"#);
+        meta.icon = Some((Bytes::from_static(b"x"), "image/png"));
+
+        // The template's own marker must survive rendering: only inline_into
+        // may consume it.
+        let rendered = crate::challenge_html("chal");
+        assert!(
+            rendered.contains("{{NG_META}}"),
+            "challenge_html consumed the marker inline_into needs"
+        );
+
+        let out = fill_for_test(page, &meta, "example.com");
+        assert!(out.contains(r#"name="description""#), "{out}");
+        assert!(out.contains(FAVICON_LINK), "{out}");
+        assert!(!out.contains("{{NG_META}}"), "{out}");
+    }
+
+    /// Mirrors `inline_into`'s splice without the network.
+    fn fill_for_test(page: &str, meta: &Meta, host: &str) -> String {
+        let mut inject = String::new();
+        for tag in &meta.tags {
+            inject.push_str(tag);
+        }
+        if meta.icon.is_some() {
+            inject.push_str(FAVICON_LINK);
+        }
+        let title = meta.title.clone().unwrap_or_else(|| host.to_string());
+        replace_title(page, &title).replacen("{{NG_META}}", &inject, 1)
+    }
+
+    #[test]
+    fn clear_marker_removes_it_without_the_origin() {
+        let page = "<head>{{NG_META}}</head>".to_string();
+        assert_eq!(clear_marker(page), "<head></head>");
     }
 }
 
@@ -934,14 +1091,154 @@ mod fetch_tests {
 
     #[tokio::test]
     async fn non_html_origin_yields_no_metadata() {
-        let origin = start_origin(|_| {
-            (200, vec![("content-type", "application/json".into())], b"{}".to_vec())
+        // Markup that *would* scrape, served under a non-HTML media type: the
+        // content type alone must stop it.
+        let markup = HTML.as_bytes().to_vec();
+        let origin = start_origin(move |_| {
+            (200, vec![("content-type", "application/json".into())], markup.clone())
         })
         .await;
 
         let client = test_client();
         let host = "jsononly.example";
         let out = inline_into(page(), &client, host, &origin.upstream()).await;
-        assert!(out.contains(&format!("<title>{host}</title>")), "{out}");
+        assert!(
+            out.contains(&format!("<title>{host}</title>")),
+            "metadata was scraped from a non-HTML response: {out}"
+        );
+        assert!(!out.contains("Origin Title"), "{out}");
+        assert!(!out.contains("og:description"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_yields_no_metadata() {
+        let markup = HTML.as_bytes().to_vec();
+        let origin = start_origin(move |_| (200, vec![], markup.clone())).await;
+
+        let client = test_client();
+        let host = "notype.example";
+        let out = inline_into(page(), &client, host, &origin.upstream()).await;
+        assert!(
+            out.contains(&format!("<title>{host}</title>")),
+            "metadata was scraped without a declared content type: {out}"
+        );
+    }
+
+    /// The favicon is fetched from the origin too, so an HTML body served at
+    /// the icon URL must not be turned into an `image/*` response.
+    #[tokio::test]
+    async fn html_served_as_favicon_is_refused() {
+        let origin = start_origin(|path| match path {
+            "/" => (
+                200,
+                vec![("content-type", "text/html".into())],
+                HTML.replace("/favicon.ico", "/icon").into_bytes(),
+            ),
+            "/icon" => (
+                200,
+                vec![("content-type", "text/html".into())],
+                b"<html><body>not an icon</body></html>".to_vec(),
+            ),
+            _ => (404, vec![], Vec::new()),
+        })
+        .await;
+
+        let client = test_client();
+        let host = "htmlicon.example";
+        let upstream = origin.upstream();
+
+        let out = inline_into(page(), &client, host, &upstream).await;
+        assert!(!out.contains("/__ng/favicon.ico"), "served HTML as an icon: {out}");
+        assert!(favicon(&client, host, &upstream).await.is_none());
     }
 }
+
+/// Reproduces the live `root-workspace.net` interstitial end to end, from the
+/// origin head captured off the wire, through the fetch-independent half of
+/// `inline_into`. This is the case that shipped broken: the marker was cleared
+/// before it could be filled, and `&#x27;` rendered literally.
+#[cfg(test)]
+mod live_regression {
+    use super::*;
+
+    /// The real `<head>` of root-workspace.net's root document (Ghost 6.41).
+    const REAL_HEAD: &str = r#"<head>
+
+    <title>root://workspace</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="We&#x27;re an independent group making hardware, software, and security tools for tech enthusiasts.">
+    <meta name="referrer" content="no-referrer-when-downgrade">
+    <meta property="og:site_name" content="root://workspace">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="root://workspace">
+    <meta property="og:description" content="We&#x27;re an independent group making hardware, software, and security tools for tech enthusiasts.">
+    <meta property="og:url" content="https://root-workspace.net/">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="root://workspace">
+    <meta name="twitter:description" content="We&#x27;re an independent group making hardware, software, and security tools for tech enthusiasts.">
+    <meta name="twitter:url" content="https://root-workspace.net/">
+    <meta name="generator" content="Ghost 6.41">
+    <link rel="icon" href="https://root-workspace.net/content/images/size/w256h256/2026/01/Untitled-design_rounded.png" type="image/png">
+</head>"#;
+
+    #[test]
+    fn real_origin_produces_a_usable_embed() {
+        let meta = scrape(REAL_HEAD);
+
+        assert_eq!(meta.title.as_deref(), Some("root://workspace"));
+        // Ghost serves the icon as an absolute same-origin URL.
+        assert_eq!(
+            meta.icon_url.as_deref(),
+            Some("https://root-workspace.net/content/images/size/w256h256/2026/01/Untitled-design_rounded.png")
+        );
+        assert_eq!(
+            same_origin_path(meta.icon_url.as_deref().unwrap(), "root-workspace.net").as_deref(),
+            Some("/content/images/size/w256h256/2026/01/Untitled-design_rounded.png")
+        );
+
+        // The rendered page must carry the metadata the marker was meant to
+        // hold. `icon` is set here as the fetch would.
+        let mut meta = meta;
+        meta.icon = Some((Bytes::from_static(b"png"), "image/png"));
+        let page = crate::challenge_html("deadbeef");
+        let out = inject_for_test(page, &meta, "root-workspace.net");
+
+        assert!(out.contains("<title>root://workspace</title>"), "{out}");
+        assert!(!out.contains("{{NG_META}}"), "marker reached the client: {out}");
+        assert!(
+            out.contains(r#"<link rel="icon" href="/__ng/favicon.ico">"#),
+            "favicon not advertised: {out}"
+        );
+
+        // The description must render as prose, not as an entity.
+        assert!(out.contains("We're an independent group"), "{out}");
+        assert!(!out.contains("&#x27;"), "raw entity reached the embed: {out}");
+        // ...and it must be escaped for its attribute context.
+        assert!(out.contains(r#"content="We're an independent group"#), "{out}");
+
+        // Non-descriptive tags stay out.
+        assert!(!out.contains("charset=utf-8"), "{out}");
+        assert!(!out.contains("generator"), "{out}");
+        assert!(!out.contains("twitter:url"), "{out}");
+        // The origin's intra-site canonical is dropped for NekoGuard's own.
+        assert!(!out.contains(r#"property="og:url""#), "{out}");
+        // The small card is upgraded so the embed renders large.
+        assert!(out.contains(r#"content="summary_large_image""#), "{out}");
+        assert!(!out.contains(r#"content="summary""#), "{out}");
+    }
+
+    /// `inline_into` minus the network: same splice, same fallbacks.
+    fn inject_for_test(page: String, meta: &Meta, host: &str) -> String {
+        let mut inject = String::new();
+        for tag in &meta.tags {
+            inject.push_str(tag);
+        }
+        if meta.icon.is_some() {
+            inject.push_str(FAVICON_LINK);
+        }
+        let title = meta.title.clone().unwrap_or_else(|| host.to_string());
+        replace_title(&page, &title).replacen("{{NG_META}}", &inject, 1)
+    }
+}
+

@@ -225,11 +225,16 @@ fn text_resp(status: StatusCode, body: &'static str) -> Response<RespBody> {
         .unwrap()
 }
 
+/// The interstitial, with the challenge and difficulty spliced in.
+///
+/// `{{NG_META}}` is deliberately left alone: `embed::inline_into` owns that
+/// marker, and clears it itself when it has nothing to inject. Clearing it
+/// here would silently strip the origin's metadata, since the injection runs
+/// afterwards.
 fn challenge_html(challenge: &str) -> String {
     CHALLENGE_HTML
         .replace("{{CHALLENGE}}", challenge)
         .replace("{{BITS}}", &pow::DIFFICULTY.to_string())
-        .replace("{{NG_META}}", "")
 }
 
 /// Response for routes NekoGuard answers itself, carrying the small set of
@@ -568,10 +573,9 @@ async fn handle(
                 Some(pq) => format!("{origin}{}", pq.as_str()),
                 None => origin,
             };
-            match HeaderValue::from_str(&loc) {
-                Ok(v) => Some(v),
-                Err(_) => None,
-            }
+            // RFC 8288: without "; rel=canonical" this is just a link, and a
+            // link a crawler ignores.
+            HeaderValue::from_str(&format!("<{loc}>; rel=\"canonical\"")).ok()
         }
         _ => None,
     };
@@ -698,7 +702,8 @@ async fn handle(
     let page = challenge_html(&pow::new_challenge(CHALLENGE_TTL));
     let page = match (&host_header, &upstream) {
         (h, Some(u)) if h != "-" => embed::inline_into(page, &client, h, u).await,
-        _ => page,
+        // No host to take metadata from, but the marker still has to go.
+        _ => embed::clear_marker(page),
     };
 
     let mut resp = local_resp(StatusCode::OK, "text/html; charset=utf-8", Bytes::from(page));
