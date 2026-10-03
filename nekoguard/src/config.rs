@@ -246,7 +246,7 @@ pub struct RedisConfig {
 
 /// Lowercase, strip any :port suffix and trailing dot so Host/SNI values
 /// compare consistently against configured domains.
-fn normalize_host(host: &str) -> String {
+pub(crate) fn normalize_host(host: &str) -> String {
     host.split(':')
         .next()
         .unwrap_or(host)

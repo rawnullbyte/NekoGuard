@@ -67,6 +67,40 @@ flowchart TB
 
 ---
 
+## Crawlers and Link Embeds
+
+Crawlers, link unfurlers and preview bots (Google, Discord, X, Slack…) never
+solve the PoW challenge — they read the interstitial, move on, and index or
+embed the placeholder instead of the site behind it.
+
+To avoid that, the interstitial carries the origin's own metadata. On the first
+challenge served for a host, NekoGuard fetches that host's root document from
+its upstream and lifts out:
+
+- the `<title>`
+- descriptive `<meta>` tags — `description`, OpenGraph and Twitter cards
+- the favicon, declared in the page as `/__ng/favicon.ico`
+
+Everything is cached per host for **5 minutes**, so a busy or bot-heavy host
+costs its upstream at most one document fetch and one favicon fetch per window.
+A fetch that fails is not cached, so the next visitor retries.
+
+Two details worth knowing:
+
+- The origin's `og:url` is dropped and `twitter:card` is upgraded to
+  `summary_large_image`. NekoGuard also sends a `Link: <…>; rel="canonical"`
+  header pointing at the protected origin, so embeds resolve to the real page
+  rather than being mistaken for the interstitial.
+- Only raster favicons (`png`, `ico`, `jpeg`, `gif`, `webp`) are served. An SVG
+  is skipped deliberately: it can carry script, and would be served from the
+  origin NekoGuard exists to shield. Cross-origin icons and redirects are
+  refused for the same reason.
+
+If the upstream can't be reached, the interstitial still renders — it just
+falls back to the hostname as its title.
+
+---
+
 ## Configuration
 
 > [!NOTE]

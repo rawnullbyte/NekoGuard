@@ -1,4 +1,5 @@
 mod config;
+mod embed;
 mod ng_log;
 mod pow;
 mod ratelimit;
@@ -83,8 +84,8 @@ const CHALLENGE_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/challenge.m
 const MAX_VERIFY_BODY: usize = 512;
 const CHALLENGE_TTL: Duration = Duration::from_secs(300); // 5 min
 
-type RespBody = BoxBody<Bytes, hyper::Error>;
-type ProxyClient = Client<HttpsConnector<HttpConnector>, RespBody>;
+pub(crate) type RespBody = BoxBody<Bytes, hyper::Error>;
+pub(crate) type ProxyClient = Client<HttpsConnector<HttpConnector>, RespBody>;
 
 #[derive(RustEmbed)]
 #[folder = "src/assets/"]
@@ -224,17 +225,22 @@ fn text_resp(status: StatusCode, body: &'static str) -> Response<RespBody> {
         .unwrap()
 }
 
-fn challenge_page(challenge: &str) -> Response<RespBody> {
-    let html = CHALLENGE_HTML
+fn challenge_html(challenge: &str) -> String {
+    CHALLENGE_HTML
         .replace("{{CHALLENGE}}", challenge)
-        .replace("{{BITS}}", &pow::DIFFICULTY.to_string());
+        .replace("{{BITS}}", &pow::DIFFICULTY.to_string())
+        .replace("{{NG_META}}", "")
+}
+
+/// Response for routes NekoGuard answers itself, carrying the small set of
+/// headers Crawlers and unfurlers look for alongside the body.
+fn local_resp(status: StatusCode, content_type: &'static str, body: Bytes) -> Response<RespBody> {
     Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .header("x-content-type-options", "nosniff")
         .header("cache-control", "no-store, private")
-        .body(Full::new(Bytes::from(html))
-            .map_err(|e: Infallible| match e {})
-            .boxed())
+        .body(Full::new(body).map_err(|e: Infallible| match e {}).boxed())
         .unwrap()
 }
 
@@ -551,6 +557,38 @@ async fn handle(
         .map(|s| s.upstream.clone())
         .or_else(|| CONFIG.catchall.as_ref().map(|c| c.upstream.clone()));
 
+    // Point crawlers at the protected origin, so the placeholder NekoGuard
+    // serves is understood to represent this page rather than be mistaken for
+    // it. The origin's own canonical link is dropped for the same reason: it
+    // can't know the address it's published at from behind the proxy.
+    let canonical = match &host_header {
+        h if h != "-" => {
+            let origin = format!("https://{}", config::normalize_host(h));
+            let loc = match req.uri().path_and_query() {
+                Some(pq) => format!("{origin}{}", pq.as_str()),
+                None => origin,
+            };
+            match HeaderValue::from_str(&loc) {
+                Ok(v) => Some(v),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+
+    // The origin's metadata, fetched only where an embed is actually
+    // rendered: the favicon route and the interstitial itself.
+    if path == "/__ng/favicon.ico" && method == Method::GET {
+        let (host, site_upstream) = match (&host_header, &upstream) {
+            (h, Some(u)) if h != "-" => (h.clone(), u.clone()),
+            _ => return Ok(text_resp(StatusCode::NOT_FOUND, "Not found")),
+        };
+        return Ok(match embed::favicon(&client, &host, &site_upstream).await {
+            Some((icon, mime)) => local_resp(StatusCode::OK, mime, icon),
+            None => text_resp(StatusCode::NOT_FOUND, "Not found"),
+        });
+    }
+
     if path == "/__ng/verify" && method == Method::POST {
         let bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
             Ok(b) => b.to_bytes(),
@@ -652,7 +690,21 @@ async fn handle(
         };
     }
 
-    let resp = challenge_page(&pow::new_challenge(CHALLENGE_TTL));
+    // Render the interstitial with the origin's own metadata, so a crawler or
+    // embedder that never solves the challenge still describes the site it's
+    // protecting. The page is built fresh each request, with the challenge
+    // spliced in before the (cached) metadata — a cached page would otherwise
+    // hand every visitor the same challenge.
+    let page = challenge_html(&pow::new_challenge(CHALLENGE_TTL));
+    let page = match (&host_header, &upstream) {
+        (h, Some(u)) if h != "-" => embed::inline_into(page, &client, h, u).await,
+        _ => page,
+    };
+
+    let mut resp = local_resp(StatusCode::OK, "text/html; charset=utf-8", Bytes::from(page));
+    if let Some(canonical) = canonical {
+        resp.headers_mut().insert("link", canonical);
+    }
     ng_log::request_log(method.as_str(), &path, 200, &host_header, "challenge", start.elapsed().as_millis() as u64);
     Ok(resp)
 }
