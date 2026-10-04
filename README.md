@@ -81,9 +81,24 @@ its upstream and lifts out:
 - descriptive `<meta>` tags — `description`, OpenGraph and Twitter cards
 - the favicon, declared in the page as `/__ng/favicon.ico`
 
-Everything is cached per host for **5 minutes**, so a busy or bot-heavy host
-costs its upstream at most one document fetch and one favicon fetch per window.
-A fetch that fails is not cached, so the next visitor retries.
+Everything is cached per host in **Redis** for **5 minutes**, keyed
+`nekoguard:embed:<host>`, so the cost of a busy or bot-heavy host doesn't scale
+with its traffic — and so replicas share one cache. On a miss a worker fetches
+the origin itself and writes the entry back; within a window the origin is only
+touched again once the entry expires. A fetch that fails is not cached, so the
+next visitor retries.
+
+Each process also keeps a short-lived copy in front of Redis, since an
+at-capacity instance renders an interstitial for every visitor and the data
+changes at most every 5 minutes. That copy is never allowed to outlive the
+Redis entry it came from. A per-host lock means a burst of visitors for one
+origin causes a single fetch rather than one per visitor; replicas still fetch
+in parallel with each other, which the Redis TTL bounds to one round of fetches
+per window rather than one per visitor.
+
+The favicon is only fetched for a host that has already served an
+interstitial: asking for `/__ng/favicon.ico` on an uncached host returns 404
+without touching the origin, so it can't be used to drive traffic upstream.
 
 Two details worth knowing:
 
@@ -282,6 +297,7 @@ url = "redis://127.0.0.1:6379"
 
 - `nekoguard:secret` — HMAC signing secret (shared across all replicas)
 - `nekoguard:rl:<ip>` — Rate limit token bucket per IP (1 hour TTL)
+- `nekoguard:embed:<host>` — Origin metadata for the PoW interstitial (5 min TTL)
 - `nekoguard:cert:<domain>` — Certs from certd (loaded on NekoGuard startup)
 
 ---
@@ -395,6 +411,7 @@ NekoGuard does **not** communicate with certd directly over HTTP — it reads ce
 | `nekoguard:cert:<domain>` | JSON `{cert_pem, key_pem}` | None (persists) |
 | `nekoguard:secret` | HMAC signing secret | None (persists) |
 | `nekoguard:rl:<ip>` | Rate limit bucket `{tokens, last_refill_ms}` | 1 hour |
+| `nekoguard:embed:<host>` | Interstitial metadata `{title, tags, icon, icon_mime}` | 5 minutes |
 
 ---
 

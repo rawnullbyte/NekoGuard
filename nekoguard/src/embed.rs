@@ -19,6 +19,7 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::{Request, StatusCode};
 use regex::{NoExpand, Regex};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, LazyLock};
@@ -68,7 +69,7 @@ static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Metadata lifted out of one origin's `<head>`.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Meta {
     title: Option<String>,
     tags: Vec<String>,
@@ -80,17 +81,121 @@ struct Meta {
     icon: Option<(Bytes, &'static str)>,
 }
 
-/// One origin's metadata, with the time it was fetched so it can go stale.
+/// The serialisable half of `Meta`: what Redis carries between replicas.
+///
+/// The icon is stored as raw bytes and restored with its type; the scraping
+/// pipeline only ever emits the handful of raster types `icon_mime` admits.
+#[derive(Serialize, Deserialize)]
+struct CachedMeta {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    icon: Option<Vec<u8>>,
+    #[serde(default)]
+    icon_mime: Option<String>,
+}
+
+/// Redis key holding one origin's metadata.
+fn cache_key(host: &str) -> String {
+    format!("nekoguard:embed:{host}")
+}
+
+impl From<&Meta> for CachedMeta {
+    fn from(meta: &Meta) -> Self {
+        let (icon, icon_mime) = match &meta.icon {
+            Some((bytes, mime)) => (Some(bytes.to_vec()), Some((*mime).to_string())),
+            None => (None, None),
+        };
+        Self { title: meta.title.clone(), tags: meta.tags.clone(), icon, icon_mime }
+    }
+}
+
+impl CachedMeta {
+    /// Rebuild a `Meta`. An icon whose type is missing or unrecognised is
+    /// dropped rather than served under a guessed content type.
+    fn into_meta(self) -> Meta {
+        let icon = self
+            .icon
+            .zip(self.icon_mime.as_deref())
+            .and_then(|(bytes, mime)| icon_mime(mime).map(|mime| (Bytes::from(bytes), mime)));
+
+        Meta { title: self.title, tags: self.tags, icon_url: None, icon }
+    }
+}
+
+/// One origin's metadata and the moment this process loaded it.
 struct Cached {
     meta: Arc<Meta>,
     fetched: Instant,
 }
 
-/// Per-host metadata cache. Each host is locked across its own fetch, so
-/// concurrent visitors solving the challenge for one origin cause a single
-/// request rather than a stampede, while a slow origin holds up only itself.
-static CACHE: LazyLock<Mutex<HashMap<String, Arc<Mutex<Option<Cached>>>>>> =
+/// Process-local tier in front of Redis. An at-capacity instance renders an
+/// interstitial for every visitor, so going to Redis on each render would put
+/// a round trip on the hot path for data that changes at most every 5 minutes.
+/// Entries are only ever as old as the Redis TTL, so serving them can't
+/// outlive the origin's window; the worst case is a replica being slightly
+/// cold after a restart, which costs one fetch.
+static LOCAL: LazyLock<Mutex<HashMap<String, Cached>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Single-flight per host, so a burst of visitors for one origin triggers one
+/// fetch rather than many. Held across the fetch; the map lock below never is.
+static INFLIGHT: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+pub(crate) struct EmbedCtx {
+    /// Reuses the process-wide pool rather than opening a connection per
+    /// request.
+    redis: redis::aio::ConnectionManager,
+}
+
+impl EmbedCtx {
+    pub(crate) fn new(redis: redis::aio::ConnectionManager) -> Self {
+        Self { redis }
+    }
+}
+
+/// A Redis error means "cache unavailable", not "no metadata": callers carry
+/// on to the origin rather than surfacing a failure.
+async fn redis_get(redis: &mut redis::aio::ConnectionManager, host: &str) -> Option<Arc<Meta>> {
+    let raw: Option<String> = redis::cmd("GET")
+        .arg(cache_key(host))
+        .query_async(redis)
+        .await
+        .map_err(|e| log::debug!("[embed] redis GET failed for {host}: {e}"))
+        .ok()?;
+    let raw = raw?;
+
+    serde_json::from_str::<CachedMeta>(&raw)
+        .map_err(|e| log::warn!("[embed] unreadable cache entry for {host}: {e}"))
+        .ok()
+        .map(|cached| Arc::new(cached.into_meta()))
+}
+
+/// Write through to Redis with the window as its TTL, so the entry expires on
+/// its own and the next reader refetches.
+async fn redis_set(
+    redis: &mut redis::aio::ConnectionManager,
+    host: &str,
+    meta: &Meta,
+) -> Option<()> {
+    let payload = serde_json::to_string(&CachedMeta::from(meta))
+        .map_err(|e| log::warn!("[embed] could not serialize metadata for {host}: {e}"))
+        .ok()?;
+
+    redis::cmd("SET")
+        .arg(cache_key(host))
+        .arg(payload)
+        .arg("EX")
+        .arg(CACHE_TTL.as_secs())
+        .query_async::<()>(redis)
+        .await
+        .map_err(|e| log::warn!("[embed] redis SET failed for {host}: {e}"))
+        .ok()
+}
 
 /// The favicon link the interstitial advertises when the origin has an icon;
 /// it maps back to this host's own `/__ng/favicon.ico`.
@@ -104,12 +209,13 @@ const FAVICON_LINK: &str = r#"<link rel="icon" href="/__ng/favicon.ico">"#;
 /// template can never leak the marker into a served page.
 pub(crate) async fn inline_into(
     page: String,
+    ctx: Option<&EmbedCtx>,
     client: &ProxyClient,
     host: &str,
     upstream: &str,
 ) -> String {
     let host = normalize_host(host);
-    let meta = load(&host, client, upstream).await;
+    let meta = load(&host, ctx, client, upstream, true).await;
 
     let mut inject = String::new();
     if let Some(meta) = &meta {
@@ -139,39 +245,106 @@ pub(crate) fn clear_marker(page: String) -> String {
 /// The origin's favicon, for the interstitial to advertise as
 /// `/__ng/favicon.ico`. `None` when the origin declares none.
 pub(crate) async fn favicon(
+    ctx: Option<&EmbedCtx>,
     client: &ProxyClient,
     host: &str,
     upstream: &str,
 ) -> Option<(Bytes, &'static str)> {
     let host = normalize_host(host);
-    load(&host, client, upstream).await?.icon.clone()
+    // A miss means this host hasn't served an interstitial within the window,
+    // so fetching now would be work nothing asked for.
+    load(&host, ctx, client, upstream, false).await?.icon.clone()
 }
 
-/// Cached metadata for `host`, refetched once `CACHE_TTL` has passed so the
-/// origin is touched at most once per window instead of once per visitor.
-async fn load(host: &str, client: &ProxyClient, upstream: &str) -> Option<Arc<Meta>> {
-    let slot = {
-        let mut cache = CACHE.lock().await;
-        // The map lock is held only long enough to find or create the slot.
-        Arc::clone(
-            cache
-                .entry(host.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(None))),
-        )
-    };
+/// Metadata for `host`: from the local tier, else Redis, else freshly fetched
+/// and written back with a 5-minute TTL.
+///
+/// `fetch_on_miss` is what the caller wants to happen when neither cache has
+/// the host. The interstitial says yes: rendering full metadata for a host
+/// nothing has fetched yet is the entire feature. The favicon route says no,
+/// so a crawler asking for an icon it was never advertised can't drive traffic
+/// to an origin that has never served an interstitial.
+async fn load(
+    host: &str,
+    ctx: Option<&EmbedCtx>,
+    client: &ProxyClient,
+    upstream: &str,
+    fetch_on_miss: bool,
+) -> Option<Arc<Meta>> {
+    if let Some(meta) = local_get(host).await {
+        return Some(meta);
+    }
 
-    let mut slot = slot.lock().await;
-    if let Some(entry) = slot.as_ref() {
-        if entry.fetched.elapsed() < CACHE_TTL {
-            return Some(Arc::clone(&entry.meta));
+    let mut conn = ctx.map(|ctx| ctx.redis.clone());
+
+    // Read-through: another replica, or this one before a restart, may have
+    // already fetched within the window.
+    if let Some(conn) = conn.as_mut() {
+        if let Some(meta) = redis_get(conn, host).await {
+            local_put(host, Arc::clone(&meta)).await;
+            return Some(meta);
         }
     }
 
-    // An unreachable origin is not cached: the next visitor retries rather
-    // than being handed five minutes of nothing.
+    if !fetch_on_miss {
+        return None;
+    }
+
+    // Serialise the fetch per host, so a burst for one origin makes a single
+    // request rather than one per visitor. Replicas still fetch in parallel —
+    // this only covers the visitors landing on one instance.
+    let lock = inflight_lock(host).await;
+    let _guard = lock.lock().await;
+
+    // A peer may have finished while this task waited for the lock.
+    if let Some(meta) = local_get(host).await {
+        return Some(meta);
+    }
+    if let Some(conn) = conn.as_mut() {
+        if let Some(meta) = redis_get(conn, host).await {
+            local_put(host, Arc::clone(&meta)).await;
+            return Some(meta);
+        }
+    }
+
     let meta = Arc::new(fetch(client, host, upstream).await?);
-    *slot = Some(Cached { meta: Arc::clone(&meta), fetched: Instant::now() });
+    local_put(host, Arc::clone(&meta)).await;
+    if let Some(conn) = conn.as_mut() {
+        redis_set(conn, host, &meta).await;
+    }
     Some(meta)
+}
+
+/// A locally cached copy, discarded once it's as old as the Redis window — so
+/// a serving replica can never outlive the entry it was minted from.
+async fn local_get(host: &str) -> Option<Arc<Meta>> {
+    let mut cache = LOCAL.lock().await;
+    match cache.get(host) {
+        Some(entry) if entry.fetched.elapsed() < CACHE_TTL => Some(Arc::clone(&entry.meta)),
+        Some(_) => {
+            cache.remove(host);
+            None
+        }
+        None => None,
+    }
+}
+
+async fn local_put(host: &str, meta: Arc<Meta>) {
+    LOCAL
+        .lock()
+        .await
+        .insert(host.to_string(), Cached { meta, fetched: Instant::now() });
+}
+
+/// Resolve the per-host fetch lock, so a burst for one origin makes one
+/// request rather than one per visitor.
+async fn inflight_lock(host: &str) -> Arc<Mutex<()>> {
+    let mut inflight = INFLIGHT.lock().await;
+    Arc::clone(
+        inflight
+            .entry(host.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
 }
 
 /// Fetch and scrape one origin. `None` means the document could not be
@@ -988,7 +1161,7 @@ mod fetch_tests {
         let host = "inline.example";
         let upstream = origin.upstream();
 
-        let out = inline_into(page(), &client, host, &upstream).await;
+        let out = inline_into(page(), None, &client, host, &upstream).await;
 
         assert!(out.contains("<title>Origin Title</title>"), "{out}");
         assert!(out.contains("og:description"), "{out}");
@@ -1006,12 +1179,12 @@ mod fetch_tests {
         assert!(hits.iter().all(|(_, h)| h == host), "{hits:?}");
 
         // The favicon is cached alongside the rest.
-        let (icon, mime) = favicon(&client, host, &upstream).await.expect("favicon");
+        let (icon, mime) = favicon(None, &client, host, &upstream).await.expect("favicon");
         assert_eq!(mime, "image/x-icon");
         assert_eq!(icon.as_ref(), ICON);
 
         // A second render inside the window must not touch the origin again.
-        let _ = inline_into(page(), &client, host, &upstream).await;
+        let _ = inline_into(page(), None, &client, host, &upstream).await;
         assert_eq!(origin.hits().await.len(), 2, "cache missed on re-render");
     }
 
@@ -1034,7 +1207,7 @@ mod fetch_tests {
 
         let client = test_client();
         let host = "redirect.example";
-        let out = inline_into(page(), &client, &host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, &host, &origin.upstream()).await;
 
         assert!(out.contains("<title>Origin Title</title>"), "{out}");
         // The document, the redirect target, then the favicon it declares.
@@ -1057,7 +1230,7 @@ mod fetch_tests {
         let host = "crossorigin.example";
         // Unreachable origins aren't cached, so this returns promptly with
         // the host as the title rather than the placeholder's.
-        let out = inline_into(page(), &client, host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, host, &origin.upstream()).await;
 
         assert!(out.contains(&format!("<title>{host}</title>")), "{out}");
         assert_eq!(origin.paths().await, vec!["/"], "redirect was followed off-origin");
@@ -1084,9 +1257,9 @@ mod fetch_tests {
         let host = "svgicon.example";
         let upstream = origin.upstream();
 
-        let out = inline_into(page(), &client, host, &upstream).await;
+        let out = inline_into(page(), None, &client, host, &upstream).await;
         assert!(!out.contains("/__ng/favicon.ico"), "svg served as favicon: {out}");
-        assert!(favicon(&client, host, &upstream).await.is_none());
+        assert!(favicon(None, &client, host, &upstream).await.is_none());
     }
 
     #[tokio::test]
@@ -1101,7 +1274,7 @@ mod fetch_tests {
 
         let client = test_client();
         let host = "jsononly.example";
-        let out = inline_into(page(), &client, host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, host, &origin.upstream()).await;
         assert!(
             out.contains(&format!("<title>{host}</title>")),
             "metadata was scraped from a non-HTML response: {out}"
@@ -1117,7 +1290,7 @@ mod fetch_tests {
 
         let client = test_client();
         let host = "notype.example";
-        let out = inline_into(page(), &client, host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, host, &origin.upstream()).await;
         assert!(
             out.contains(&format!("<title>{host}</title>")),
             "metadata was scraped without a declared content type: {out}"
@@ -1147,9 +1320,9 @@ mod fetch_tests {
         let host = "htmlicon.example";
         let upstream = origin.upstream();
 
-        let out = inline_into(page(), &client, host, &upstream).await;
+        let out = inline_into(page(), None, &client, host, &upstream).await;
         assert!(!out.contains("/__ng/favicon.ico"), "served HTML as an icon: {out}");
-        assert!(favicon(&client, host, &upstream).await.is_none());
+        assert!(favicon(None, &client, host, &upstream).await.is_none());
     }
 }
 
@@ -1242,3 +1415,417 @@ mod live_regression {
     }
 }
 
+
+/// Exercises the Redis path against a fake server speaking enough RESP to
+/// answer the commands `embed` issues. The cache wiring — key shape, the TTL
+/// it sets, the JSON it stores, and the read-through order — is what the
+/// replication story rests on, and none of it runs with `ctx: None`.
+#[cfg(test)]
+mod redis_tests {
+    use super::*;
+    use http_body_util::Full;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::Response;
+    use hyper_tls::HttpsConnector;
+    use hyper_util::client::legacy::{connect::HttpConnector, Client};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const HTML_ONE: &str = r#"<head><title>First Title</title>
+        <meta name="description" content="first description">
+        <link rel="icon" href="/favicon.ico"></head>"#;
+
+    const HTML_TWO: &str = r#"<head><title>Second Title</title>
+        <meta name="description" content="second description">
+        <link rel="icon" href="/favicon.ico"></head>"#;
+
+    /// What the fake Redis saw, and what it holds.
+    #[derive(Default)]
+    struct Store {
+        data: Mutex<std::collections::HashMap<String, String>>,
+        log: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Store {
+        async fn commands(&self) -> Vec<Vec<String>> {
+            self.log.lock().await.clone()
+        }
+        async fn keys_set(&self) -> Vec<String> {
+            self.commands()
+                .await
+                .into_iter()
+                .filter(|c| c.first().map(|s| s.eq_ignore_ascii_case("set")).unwrap_or(false))
+                .map(|c| c[1].clone())
+                .collect()
+        }
+        async fn get(&self, key: &str) -> Option<String> {
+            self.data.lock().await.get(key).cloned()
+        }
+        async fn seed(&self, key: &str, value: &str) {
+            self.data.lock().await.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    fn encode_bulk(s: &str) -> Vec<u8> {
+        format!("${}\r\n{}\r\n", s.len(), s).into_bytes()
+    }
+
+    /// Read one RESP array of bulk strings.
+    async fn read_command<R: AsyncReadExt + Unpin>(r: &mut R) -> Option<Vec<String>> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        // Header line: *<count>. Push before testing, or the byte that
+        // completes the line is tested against the previous one and eaten.
+        loop {
+            if r.read(&mut byte).await.ok()? == 0 {
+                return None;
+            }
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n") {
+                break;
+            }
+        }
+        let count: usize = String::from_utf8_lossy(&buf[1..buf.len() - 2]).parse().ok()?;
+
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut len_line = Vec::new();
+            loop {
+                if r.read(&mut byte).await.ok()? == 0 {
+                    return None;
+                }
+                len_line.push(byte[0]);
+                if len_line.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            let len: usize = String::from_utf8_lossy(&len_line[1..len_line.len() - 2])
+                .parse()
+                .ok()?;
+            let mut val = vec![0u8; len + 2];
+            r.read_exact(&mut val).await.ok()?;
+            val.truncate(len);
+            out.push(String::from_utf8_lossy(&val).to_string());
+        }
+        Some(out)
+    }
+
+    /// Serves RESP over TCP; returns its address and the shared store.
+    async fn start_redis() -> (SocketAddr, Arc<Store>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store = Arc::new(Store::default());
+        let shared = Arc::clone(&store);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let store = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    while let Some(cmd) = read_command(&mut tcp).await {
+                        if cmd.is_empty() {
+                            continue;
+                        }
+                        store.log.lock().await.push(cmd.clone());
+                        let verb = cmd[0].to_ascii_uppercase();
+                        let reply: Vec<u8> = match verb.as_str() {
+                            "GET" => match store.data.lock().await.get(&cmd[1]) {
+                                Some(v) => encode_bulk(v),
+                                None => b"$-1\r\n".to_vec(),
+                            },
+                            "SET" => {
+                                store.data.lock().await.insert(cmd[1].clone(), cmd[2].clone());
+                                b"+OK\r\n".to_vec()
+                            }
+                            // Handshake and anything else: succeed quietly.
+                            _ => b"+OK\r\n".to_vec(),
+                        };
+                        if tcp.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, store)
+    }
+
+    async fn ctx_for(addr: SocketAddr) -> EmbedCtx {
+        let client = redis::Client::open(format!("redis://{addr}")).expect("redis url");
+        let manager = client.get_connection_manager().await.expect("connect to fake redis");
+        EmbedCtx::new(manager)
+    }
+
+    /// An HTTP origin whose body can be swapped between requests.
+    async fn start_origin() -> (String, Arc<Mutex<&'static str>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body: Arc<Mutex<&'static str>> = Arc::new(Mutex::new(HTML_ONE));
+        let shared = Arc::clone(&body);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let body = Arc::clone(&body);
+                        async move {
+                            let path = req.uri().path().to_string();
+                            let (ct, bytes) = if path == "/favicon.ico" {
+                                ("image/png", b"icon".to_vec())
+                            } else {
+                                ("text/html; charset=utf-8", body.lock().await.as_bytes().to_vec())
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header("content-type", ct)
+                                    .body(Full::new(Bytes::from(bytes)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(tcp), service)
+                        .await;
+                });
+            }
+        });
+
+        (format!("http://127.0.0.1:{port}"), body)
+    }
+
+    fn test_client() -> ProxyClient {
+        let tls = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        Client::builder(TokioExecutor::new()).build(HttpsConnector::from((http, tls.into())))
+    }
+
+    fn page() -> String {
+        "<html><head><title>Verifying your connection</title>{{NG_META}}</head><body>x</body></html>"
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn writes_a_five_minute_entry_under_a_host_scoped_key() {
+        let (redis, store) = start_redis().await;
+        let (upstream, _) = start_origin().await;
+        let ctx = ctx_for(redis).await;
+        let client = test_client();
+        let host = "writes.example";
+
+        let _ = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+
+        let set = store
+            .commands()
+            .await
+            .into_iter()
+            .find(|c| c[0].eq_ignore_ascii_case("SET"))
+            .expect("no SET reached redis");
+
+        assert_eq!(set[1], format!("nekoguard:embed:{host}"));
+        // TTL is passed as the trailing EX argument.
+        assert_eq!(set[3].to_ascii_uppercase(), "EX");
+        assert_eq!(set[4], "300");
+
+        let stored = store.get(&set[1]).await.expect("entry absent");
+        let parsed: CachedMeta = serde_json::from_str(&stored).expect("entry not JSON");
+        assert_eq!(parsed.title.as_deref(), Some("First Title"));
+        assert!(parsed.tags.iter().any(|t| t.contains("first description")));
+        assert_eq!(parsed.icon.as_deref(), Some(b"icon".as_slice()));
+        assert_eq!(parsed.icon_mime.as_deref(), Some("image/png"));
+    }
+
+    /// The point of the change: a replica that has never fetched still renders
+    /// full metadata, because another replica put it in Redis.
+    #[tokio::test]
+    async fn a_cold_replica_renders_from_redis_without_fetching() {
+        let (redis, store) = start_redis().await;
+        let (upstream, body) = start_origin().await;
+        let ctx = ctx_for(redis).await;
+        let client = test_client();
+        let host = "coldreplica.example";
+
+        // Another replica's entry, already in Redis.
+        let seeded = CachedMeta {
+            title: Some("Seeded Title".into()),
+            tags: vec![r#"<meta name="description" content="seeded description">"#.into()],
+            icon: Some(b"icon".into()),
+            icon_mime: Some("image/png".into()),
+        };
+        store
+            .seed(&cache_key(host), &serde_json::to_string(&seeded).unwrap())
+            .await;
+
+        // Origin is serving *different* content; if it were consulted the
+        // title would give it away.
+        *body.lock().await = HTML_TWO;
+
+        let out = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+
+        assert!(out.contains("<title>Seeded Title</title>"), "{out}");
+        assert!(out.contains("seeded description"), "{out}");
+        assert!(out.contains(FAVICON_LINK), "{out}");
+        assert!(!out.contains("Second Title"), "origin was fetched: {out}");
+        assert!(
+            store.keys_set().await.is_empty(),
+            "cold replica wrote instead of reading through"
+        );
+    }
+
+    /// A cold replica asked for the favicon serves the cached icon and does
+    /// not fetch one of its own.
+    #[tokio::test]
+    async fn cold_replica_serves_the_cached_icon() {
+        let (redis, store) = start_redis().await;
+        let (upstream, _) = start_origin().await;
+        let ctx = ctx_for(redis).await;
+        let client = test_client();
+        let host = "coldicon.example";
+
+        store
+            .seed(
+                &cache_key(host),
+                &serde_json::to_string(&CachedMeta {
+                    title: Some("T".into()),
+                    tags: vec![],
+                    icon: Some(b"cached-icon".into()),
+                    icon_mime: Some("image/png".into()),
+                })
+                .unwrap(),
+            )
+            .await;
+
+        let (bytes, mime) = favicon(Some(&ctx), &client, host, &upstream)
+            .await
+            .expect("favicon from cache");
+        assert_eq!(&bytes[..], b"cached-icon");
+        assert_eq!(mime, "image/png");
+    }
+
+    /// With nothing in either cache, the favicon route must not fetch — a
+    /// crawler asking for an icon it was never told about shouldn't be able to
+    /// drive traffic to the origin.
+    #[tokio::test]
+    async fn favicon_without_a_cache_entry_does_not_fetch() {
+        let (redis, store) = start_redis().await;
+        let (upstream, _) = start_origin().await;
+        let ctx = ctx_for(redis).await;
+        let client = test_client();
+
+        assert!(favicon(Some(&ctx), &client, "neverfetched.example", &upstream)
+            .await
+            .is_none());
+        assert!(store.keys_set().await.is_empty(), "an unrequested fetch was cached");
+    }
+
+    /// An entry whose icon type is unrecognised is dropped on read rather than
+    /// being served under a guessed content type.
+    #[tokio::test]
+    async fn unreadable_icon_type_is_dropped_not_guessed() {
+        let (redis, store) = start_redis().await;
+        let (upstream, _) = start_origin().await;
+        let ctx = ctx_for(redis).await;
+        let client = test_client();
+        let host = "badmime.example";
+
+        store
+            .seed(
+                &cache_key(host),
+                &serde_json::to_string(&CachedMeta {
+                    title: Some("T".into()),
+                    tags: vec![r#"<meta name="description" content="d">"#.into()],
+                    icon: Some(b"<svg onload=alert(1)/>".into()),
+                    icon_mime: Some("image/svg+xml".into()),
+                })
+                .unwrap(),
+            )
+            .await;
+
+        assert!(favicon(Some(&ctx), &client, host, &upstream).await.is_none());
+        // The rest of the entry still renders.
+        let out = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+        assert!(out.contains("<title>T</title>"), "{out}");
+        assert!(!out.contains(FAVICON_LINK), "{out}");
+    }
+
+    /// A corrupt entry is a miss, not a crash, and is replaced by a fetch.
+    #[tokio::test]
+    async fn corrupt_entry_is_refetched() {
+        let (redis, store) = start_redis().await;
+        let (upstream, _) = start_origin().await;
+        let ctx = ctx_for(redis).await;
+        let client = test_client();
+        let host = "corrupt.example";
+
+        store.seed(&cache_key(host), "{not json").await;
+
+        let out = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+        assert!(out.contains("First Title"), "{out}");
+        // ...and the bad value is overwritten with a good one.
+        let stored = store.get(&cache_key(host)).await.unwrap();
+        assert!(serde_json::from_str::<CachedMeta>(&stored).is_ok());
+    }
+
+    /// With Redis unreachable, the interstitial still renders from the origin
+    /// rather than failing closed.
+    #[tokio::test]
+    async fn unreachable_redis_falls_through_to_the_origin() {
+        let (upstream, _) = start_origin().await;
+        let client = test_client();
+
+        // A port nothing is listening on.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let redis_client = redis::Client::open(format!("redis://{addr}")).unwrap();
+        let manager = match redis_client.get_connection_manager().await {
+            Ok(m) => m,
+            // ConnectionManager connects lazily; a failure here is equally fine.
+            Err(_) => {
+                let out = inline_into(page(), None, &client, "deadredis.example", &upstream).await;
+                assert!(out.contains("First Title"), "{out}");
+                return;
+            }
+        };
+        let ctx = EmbedCtx::new(manager);
+
+        let out = inline_into(page(), Some(&ctx), &client, "deadredis.example", &upstream).await;
+        assert!(out.contains("First Title"), "{out}");
+    }
+
+    #[test]
+    fn cached_meta_round_trips() {
+        let mut meta = Meta::default();
+        meta.title = Some("Toolbox & Co.".into());
+        meta.tags = vec![r#"<meta name="description" content="a test">"#.into()];
+        meta.icon = Some((Bytes::from_static(b"\x89PNG"), "image/png"));
+
+        let json = serde_json::to_string(&CachedMeta::from(&meta)).unwrap();
+        let back = serde_json::from_str::<CachedMeta>(&json).unwrap().into_meta();
+
+        assert_eq!(back.title, meta.title);
+        assert_eq!(back.tags, meta.tags);
+        assert_eq!(back.icon.as_ref().map(|(b, m)| (b.as_ref(), *m)), Some((b"\x89PNG".as_slice(), "image/png")));
+        // The declared URL is fetch-time state and is not carried.
+        assert!(back.icon_url.is_none());
+    }
+
+    #[test]
+    fn cache_key_is_namespaced_and_host_scoped() {
+        assert_eq!(cache_key("example.com"), "nekoguard:embed:example.com");
+        assert_ne!(cache_key("a.example"), cache_key("b.example"));
+    }
+}

@@ -526,6 +526,7 @@ async fn handle(
     client: Arc<ProxyClient>,
     session: Arc<session::SessionManager>,
     redis_conn: Arc<tokio::sync::Mutex<redis::aio::ConnectionManager>>,
+    embed_ctx: Arc<embed::EmbedCtx>,
     peer_ip: IpAddr,
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
@@ -587,7 +588,7 @@ async fn handle(
             (h, Some(u)) if h != "-" => (h.clone(), u.clone()),
             _ => return Ok(text_resp(StatusCode::NOT_FOUND, "Not found")),
         };
-        return Ok(match embed::favicon(&client, &host, &site_upstream).await {
+        return Ok(match embed::favicon(Some(&embed_ctx), &client, &host, &site_upstream).await {
             Some((icon, mime)) => local_resp(StatusCode::OK, mime, icon),
             None => text_resp(StatusCode::NOT_FOUND, "Not found"),
         });
@@ -701,7 +702,9 @@ async fn handle(
     // hand every visitor the same challenge.
     let page = challenge_html(&pow::new_challenge(CHALLENGE_TTL));
     let page = match (&host_header, &upstream) {
-        (h, Some(u)) if h != "-" => embed::inline_into(page, &client, h, u).await,
+        (h, Some(u)) if h != "-" => {
+            embed::inline_into(page, Some(&embed_ctx), &client, h, u).await
+        }
         // No host to take metadata from, but the marker still has to go.
         _ => embed::clear_marker(page),
     };
@@ -832,6 +835,11 @@ async fn main_inner() {
             .expect("failed to connect to Redis"),
     ));
 
+    // Origin metadata for the interstitial. Its own clone of the connection
+    // manager, so a fetch never queues behind the certify/lock path — the two
+    // are independent and each is cheap to hold.
+    let embed_ctx = Arc::new(embed::EmbedCtx::new(redis_conn.lock().await.clone()));
+
     // Load TLS config from Redis certs
     let tls_config = load_tls_config(&redis_conn).await;
     let tls_config = Arc::new(arc_swap::ArcSwap::from_pointee(tls_config));
@@ -888,6 +896,7 @@ async fn main_inner() {
             let client = Arc::clone(&client);
             let sess = Arc::clone(&sess);
             let redis_conn = Arc::clone(&redis_conn);
+            let embed_ctx = Arc::clone(&embed_ctx);
             tokio::spawn(async move {
                 loop {
                     let (mut tcp, peer) = match http_listener.accept().await {
@@ -902,6 +911,7 @@ async fn main_inner() {
                     let client = Arc::clone(&client);
                     let sess_c = Arc::clone(&sess);
                     let redis_conn = Arc::clone(&redis_conn);
+                    let embed_ctx = Arc::clone(&embed_ctx);
                     tokio::spawn(async move {
                         let sess = sess_c;
                         // Peek at the raw bytes to detect WebSocket upgrade
@@ -940,7 +950,7 @@ async fn main_inner() {
                         let conn = http1::Builder::new().serve_connection(
                             io,
                             service_fn(move |req| {
-                                handle(req, Arc::clone(&client), Arc::clone(&sess), Arc::clone(&redis_conn), peer_ip)
+                                handle(req, Arc::clone(&client), Arc::clone(&sess), Arc::clone(&redis_conn), Arc::clone(&embed_ctx), peer_ip)
                             }),
                         );
                         let _ = conn.with_upgrades().await;
@@ -978,6 +988,7 @@ async fn main_inner() {
         let client = Arc::clone(&client);
         let sess = Arc::clone(&sess);
         let redis_conn = Arc::clone(&redis_conn);
+        let embed_ctx = Arc::clone(&embed_ctx);
 
         tokio::spawn(async move {
             let start_handshake = match LazyConfigAcceptor::new(Default::default(), tcp).await {
@@ -1149,7 +1160,16 @@ async fn main_inner() {
             let io = TokioIo::new(prefixed);
             let conn = http1::Builder::new().serve_connection(
                 io,
-                service_fn(move |req| handle(req, Arc::clone(&client), Arc::clone(&sess), Arc::clone(&redis_conn), peer_ip)),
+                service_fn(move |req| {
+                    handle(
+                        req,
+                        Arc::clone(&client),
+                        Arc::clone(&sess),
+                        Arc::clone(&redis_conn),
+                        Arc::clone(&embed_ctx),
+                        peer_ip,
+                    )
+                }),
             );
             let _ = conn.with_upgrades().await;
         });
