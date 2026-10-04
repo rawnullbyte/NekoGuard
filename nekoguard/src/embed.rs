@@ -19,6 +19,7 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::{Request, StatusCode};
 use regex::{NoExpand, Regex};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -37,6 +38,11 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Largest origin document scanned, and largest favicon kept.
+///
+/// This bounds what is *read* from the origin, not the document's size: the
+/// fetch stops once `</head>` has been seen, which is all the metadata there
+/// is. A document whose head alone exceeds this is refused rather than
+/// partially scraped.
 const MAX_HTML: usize = 512 * 1024;
 const MAX_ICON: usize = 2 * 1024 * 1024;
 
@@ -462,16 +468,74 @@ async fn fetch_html(
             return None;
         }
 
-        let body = tokio::time::timeout(
-            FETCH_TIMEOUT,
-            Limited::new(resp.into_body(), MAX_HTML).collect(),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        return String::from_utf8(body.to_bytes().to_vec()).ok();
+        return read_head(resp.into_body()).await;
     }
     None
+}
+
+/// Read a document only as far as the end of its head.
+///
+/// The metadata lives in the first few kilobytes, so reading a whole article
+/// to find it is wasted work — and for a long post it was actively harmful:
+/// a 750 KB page exceeded the read cap, the fetch failed, and the interstitial
+/// fell back to the bare hostname. Stopping at `</head>` makes page weight
+/// irrelevant to whether metadata can be extracted.
+async fn read_head(body: hyper::body::Incoming) -> Option<String> {
+    /// Length of the marker searched for; also the chunk-overlap window.
+    const MARKER_LEN: usize = b"</head".len();
+
+    let mut stream = body.into_data_stream();
+    let mut collected: Vec<u8> = Vec::with_capacity(16 * 1024);
+    // Everything before this has already been searched, so each chunk is
+    // scanned once rather than rescanning the whole buffer every time.
+    let mut scanned = 0usize;
+    let mut head_end: Option<usize> = None;
+
+    let read = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.ok()?;
+            collected.extend_from_slice(&chunk);
+
+            if let Some(at) = find_head_end(&collected, scanned) {
+                head_end = Some(at);
+                return Some(());
+            }
+            // Back up by one marker's overlap, so a marker split across two
+            // chunks is still found.
+            scanned = collected.len().saturating_sub(MARKER_LEN - 1);
+
+            if collected.len() > MAX_HTML {
+                // No head end within the cap. Refuse rather than scrape a
+                // truncated head, which would silently drop metadata.
+                return None;
+            }
+        }
+        // Stream ended without a head end: hand back what was read, since a
+        // fragment may still carry the tags.
+        Some(())
+    };
+
+    tokio::time::timeout(FETCH_TIMEOUT, read).await.ok().flatten()?;
+
+    if let Some(at) = head_end {
+        collected.truncate(at);
+    }
+    Some(String::from_utf8_lossy(&collected).into_owned())
+}
+
+/// Find `</head` at or after `from`, returning its index.
+///
+/// Searches the buffer rather than only its tail: a head that arrives in a
+/// single chunk, as it usually does, has the marker in the middle of the
+/// buffer, not at the end of it.
+fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
+    const MARKER: &[u8] = b"</head";
+    if buf.len() < MARKER.len() {
+        return None;
+    }
+    let last = buf.len() - MARKER.len();
+    let start = from.min(last);
+    (start..=last).find(|&i| buf[i..i + MARKER.len()].eq_ignore_ascii_case(MARKER))
 }
 
 /// Fetch the declared favicon. Only same-origin URLs are retrieved, and only
@@ -1327,6 +1391,63 @@ mod fetch_tests {
         let out = inline_into(page(), None, &client, host, &upstream, "/").await;
         assert!(!out.contains("/__ng/favicon.ico"), "svg served as favicon: {out}");
         assert!(favicon(None, &client, host, &upstream, "/").await.is_none());
+    }
+
+    /// A long article must still yield metadata.
+    ///
+    /// Regression: the fetch used to read the whole body under a 512 KiB cap,
+    /// so a 750 KB post exceeded it and the interstitial fell back to the
+    /// bare hostname. The metadata is in the head, so the read stops there and
+    /// document length stops mattering.
+    #[tokio::test]
+    async fn a_document_far_larger_than_the_cap_still_yields_metadata() {
+        // Far past MAX_HTML, with the metadata at the very start.
+        let huge = format!(
+            "<!doctype html><html><head><title>Long Read</title>\
+             <meta name=\"description\" content=\"a very long article\"></head>\
+             <body>{}</body></html>",
+            "<p>body text that goes on and on</p>".repeat(30_000)
+        );
+        // ~1 MB of body against a 512 KiB read cap: the old whole-body read
+        // would have refused this outright.
+        assert!(huge.len() > MAX_HTML * 2, "fixture must exceed the cap: {}", huge.len());
+
+        let origin = start_origin(move |_| {
+            (200, vec![("content-type", "text/html; charset=utf-8".into())], huge.clone().into_bytes())
+        })
+        .await;
+
+        let client = test_client();
+        let host = "longread.example";
+        let out = inline_into(page(), None, &client, host, &origin.upstream(), "/a-long-post/").await;
+
+        assert!(out.contains("<title>Long Read</title>"), "metadata lost: {out}");
+        assert!(out.contains("a very long article"), "{out}");
+    }
+
+    /// A very long head is refused rather than partially scraped, so a
+    /// truncated scrape can't silently drop tags.
+    #[tokio::test]
+    async fn an_endless_head_is_refused() {
+        // No </head> anywhere, and far past the cap.
+        let endless = format!(
+            "<!doctype html><html><head><title>Never Ends</title>{}",
+            "<!-- filler -->".repeat(60_000)
+        );
+        assert!(endless.len() > MAX_HTML, "fixture must exceed the cap");
+
+        let origin = start_origin(move |_| {
+            (200, vec![("content-type", "text/html".into())], endless.clone().into_bytes())
+        })
+        .await;
+
+        let client = test_client();
+        let host = "endless.example";
+        let out = inline_into(page(), None, &client, host, &origin.upstream(), "/x/").await;
+
+        // Falls back to the host rather than serving a half-scraped head.
+        assert!(out.contains(&format!("<title>{host}</title>")), "{out}");
+        assert!(!out.contains("Never Ends"), "a truncated head was scraped: {out}");
     }
 
     /// The whole point of path-scoped caching: a subpage's interstitial must
