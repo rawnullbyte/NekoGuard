@@ -38,6 +38,8 @@ base64 = "0.23.1"
 arc-swap = "1.9.2"
 rustls-pki-types = "1.15.1"
 aes-gcm = "0.11.1"
+brotli = "9.0.0"
+flate2 = "1.1.10"
 
 [build-dependencies]
 minify-html = "0.15"

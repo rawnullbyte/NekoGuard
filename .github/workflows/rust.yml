@@ -38,3 +38,13 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --verbose
+
+      # The injected renewal script is browser code and can't be covered by
+      # the Rust tests; these exercise its queue, expiry and wake-up handling.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test injected client script
+        run: node --test nekoguard/tests/guard.test.mjs

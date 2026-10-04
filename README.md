@@ -67,6 +67,55 @@ flowchart TB
 
 ---
 
+## Clearance Renewal in the Browser
+
+A clearance cookie expires after `session.ttl`. Once it does, a background AJAX
+call — Ghost's draft autosave, say — is answered with the PoW interstitial: a
+`200 text/html` document where the caller expected JSON. The call fails.
+
+To prevent that, NekoGuard splices a renewal script into HTML **documents** it
+proxies. The script:
+
+- renews in the background once the token is within **5 minutes of expiry**,
+  computed as `TTL - 5min` from the configured TTL (not a hardcoded value);
+- solves on a Web Worker so the UI never blocks, falling back to the main
+  thread where Blob workers are unavailable;
+- keeps checking while the tab is hidden, so long background jobs survive;
+- detects system sleep from a `Date.now()` jump and renews before releasing
+  anything held; and
+- **queues requests only while the session is genuinely invalid.** Inside the
+  buffer window the cookie is still accepted, so calls pass straight through
+  while renewal runs in the background.
+
+Requests held during an outage are released after 30s so a wedged solve can't
+hang a page forever.
+
+The current TTL and difficulty are rendered into the page from configuration,
+so the client never guesses them.
+
+### How injection decides
+
+Bodies are only rewritten when **all** of these hold:
+
+| Condition | Why |
+|---|---|
+| `Content-Type` is `text/html` | Injecting into JSON/JS/CSS/images corrupts them |
+| The request is a navigation | Background calls already have the script; rewriting them is waste |
+| The site isn't `bypass`ed | A bypassed site has no clearance to renew |
+| `Content-Encoding` round-trips | `br`, `gzip`, `deflate` and identity only |
+| The body decodes within 4 MiB | Bounds decompression bombs |
+
+Anything else — including a decode failure or an oversized document — is
+returned **byte-for-byte untouched**. Injection is best-effort by design: a bug
+here must degrade to an unmodified page, never a broken one.
+
+Because the origin typically compresses HTML, an injected document is decoded,
+rewritten and re-encoded to whatever the client asked for. That is real CPU on
+every navigation, which is why the document test above exists — API calls,
+assets and bypassed sites skip the work entirely.
+
+---
+
 ## Crawlers and Link Embeds
 
 Crawlers, link unfurlers and preview bots (Google, Discord, X, Slack…) never

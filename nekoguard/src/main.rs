@@ -1,5 +1,6 @@
 mod config;
 mod embed;
+mod inject;
 mod ng_log;
 mod pow;
 mod ratelimit;
@@ -292,11 +293,147 @@ fn strip_cookie_domain(cookie: &str) -> String {
         .join(";")
 }
 
+/// The renewal script, spliced into documents the origin serves.
+const GUARD_JS: &str = include_str!("assets/guard.js");
+
+/// Whether a request is a navigation — a document a browser will parse and run
+/// scripts in — rather than a subresource or a background call.
+///
+/// `Sec-Fetch-Dest` is the reliable signal where it exists; background XHR
+/// reports `empty`, and Ghost's editor autosaves are exactly that. Injecting
+/// there is wasted work: the page already has the script.
+fn is_document_request(headers: &hyper::HeaderMap) -> bool {
+    match headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+        Some(dest) => dest.trim().eq_ignore_ascii_case("document"),
+        // No hint (older browser, or a non-browser client): the Accept header
+        // is the next best thing. A bare `*/*` is a fetch(), not a navigation.
+        None => headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .map(|a| a.contains("text/html"))
+            .unwrap_or(false),
+    }
+}
+
+/// The encoding of a proxied response, or `None` when the body can't be
+/// round-tripped and must be returned untouched.
+///
+/// Header-only: the caller uses this to decide whether reading the body is
+/// worth it, so it must not consume anything.
+fn response_encoding(parts: &hyper::http::response::Parts) -> Option<inject::Encoding> {
+    inject::Encoding::from_header(
+        parts
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// Whether this response is one we would inject into, judged from headers
+/// alone. Anything else keeps its streamed body and costs nothing.
+fn should_inject_response(parts: &hyper::http::response::Parts, document: bool, bypassed: bool) -> bool {
+    let content_type = parts
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+
+    document
+        && !bypassed
+        && inject::should_inject(
+            content_type,
+            true,
+            // The cap is enforced during decode; a body already over it is
+            // detected there and returned unchanged.
+            true,
+            response_encoding(parts).is_some(),
+            false,
+        )
+}
+
+/// Decode a proxied document, splice in the renewal script, and re-encode.
+///
+/// Always returns a body: either the rewritten document, or the original
+/// bytes when the body turned out not to be injectable after all (a decode
+/// failure, an unreadable type, an oversized document). Failing back to the
+/// original is the whole point — an injection bug must never break a page.
+async fn inject_renewal_script(
+    parts: &hyper::http::response::Parts,
+    body: hyper::body::Incoming,
+    // Passed in rather than read from CONFIG, so this stays a pure function of
+    // its inputs and can be exercised without a config file on disk.
+    session_ttl: u64,
+) -> (Bytes, usize) {
+    let encoding = match response_encoding(parts) {
+        Some(encoding) => encoding,
+        // Unreachable via `should_inject_response`, but be explicit.
+        None => {
+            let raw = Limited::new(body, inject::MAX_DECOMPRESSED + 1)
+                .collect()
+                .await
+                .map(|b| b.to_bytes())
+                .unwrap_or_default();
+            return (raw.clone(), raw.len());
+        }
+    };
+
+    let raw = match Limited::new(body, inject::MAX_DECOMPRESSED + 1)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return (Bytes::new(), 0),
+    };
+
+    // A body at the cap is passed through rather than truncated: a partial
+    // document would be worse than an unmodified one.
+    if raw.len() > inject::MAX_DECOMPRESSED {
+        log::debug!("[inject] document over the decode cap; passing through");
+        return (raw.clone(), raw.len());
+    }
+
+    // A decode or re-encode failure of any kind falls back to the original
+    // bytes, so a malformed stream can never be served as corruption.
+    let rewritten = (|| {
+        let decoded = inject::decompress(&raw, encoding)?;
+        if !inject::looks_like_html(&decoded) {
+            log::debug!("[inject] text/html body did not decode to HTML; passing through");
+            return None;
+        }
+        let html = String::from_utf8(decoded).ok()?;
+
+        // The live TTL is rendered in ahead of the script, so the client reads
+        // the configured value rather than a hardcoded copy of it.
+        let prelude = format!(
+            "<script>window.__NG_CONFIG__={{bits:{},ttl:{},renew:\"/__ng/challenge\",verify:\"/__ng/verify\"}};</script>",
+            pow::DIFFICULTY,
+            session_ttl
+        );
+        let snippet = format!("{prelude}{}", inject::script_tag(GUARD_JS));
+
+        let mutated = inject::inject_into_html(&html, &snippet);
+        inject::compress(mutated.into_bytes(), encoding)
+    })();
+
+    match rewritten {
+        Some(encoded) => {
+            let length = encoded.len();
+            (Bytes::from(encoded), length)
+        }
+        None => (raw.clone(), raw.len()),
+    }
+}
+
 // Proxy
 async fn proxy_to_upstream(
     client: &ProxyClient,
     req: Request<Incoming>,
     upstream: &str,
+    // Whether the client asked for a document rather than a subresource or a
+    // background call. Only documents carry the renewal script.
+    document_request: bool,
+    // Paths exempted from protection have no clearance to renew, so paying
+    // decode+re-encode on every navigation there would be pure waste.
+    site_bypassed: bool,
 ) -> Response<RespBody> {
     let (mut parts, body) = req.into_parts();
 
@@ -401,6 +538,19 @@ async fn proxy_to_upstream(
                 for val in patched {
                     rp.headers.append("set-cookie", val);
                 }
+            }
+
+            // Documents carry the clearance-renewal script. Everything else —
+            // JSON, JS, CSS, images, WebSockets, bypassed sites — keeps its
+            // streamed body and is returned untouched.
+            if should_inject_response(&rp, document_request, site_bypassed) {
+                let (body, length) =
+                    inject_renewal_script(&rp, rb, CONFIG.session.ttl).await;
+                // The encoded length changed, so the header has to follow.
+                if let Ok(val) = HeaderValue::from_str(&length.to_string()) {
+                    rp.headers.insert("content-length", val);
+                }
+                return Response::from_parts(rp, Full::new(body).map_err(|e: Infallible| match e {}).boxed());
             }
 
             Response::from_parts(rp, rb.boxed())
@@ -594,6 +744,23 @@ async fn handle(
         });
     }
 
+    // Mints a challenge for a page that is already loaded. The interstitial
+    // carries its own challenge in the HTML, which a background renewal can't
+    // read — so renewals ask for one here instead.
+    if path == "/__ng/challenge" && method == Method::GET {
+        let body = serde_json::json!({
+            "challenge": pow::new_challenge(CHALLENGE_TTL),
+            "bits": pow::DIFFICULTY,
+            "ttl": session.ttl().as_secs(),
+        })
+        .to_string();
+        return Ok(local_resp(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(body),
+        ));
+    }
+
     if path == "/__ng/verify" && method == Method::POST {
         let bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
             Ok(b) => b.to_bytes(),
@@ -648,6 +815,10 @@ async fn handle(
     let host = req.headers().get("host").and_then(|v| v.to_str().ok());
     let req_path = req.uri().path();
 
+    // Read off the request before it is consumed by the proxy: only
+    // navigations get the renewal script.
+    let document_request = is_document_request(req.headers());
+
     let bypass_match = host
         .and_then(|h| CONFIG.site_for_host(h))
         .and_then(|site| {
@@ -684,7 +855,14 @@ async fn handle(
 
         return match upstream {
             Some(u) => {
-                let resp = proxy_to_upstream(&client, req, &u).await;
+                let resp = proxy_to_upstream(
+                    &client,
+                    req,
+                    &u,
+                    document_request,
+                    bypass_match.is_some(),
+                )
+                .await;
                 ng_log::request_log(method.as_str(), &path, resp.status().as_u16(), &host_header, &u, start.elapsed().as_millis() as u64);
                 Ok(resp)
             }
@@ -1173,5 +1351,219 @@ async fn main_inner() {
             );
             let _ = conn.with_upgrades().await;
         });
+    }
+}
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use inject::Encoding;
+
+    /// Representative of what Ghost serves: a document with a body, a closing
+    /// tag, and enough repetition to compress well under Brotli.
+    fn document() -> String {
+        format!(
+            "<!doctype html><html><head><title>Post</title></head><body>{}</body></html>",
+            "<article><p>editor content</p></article>".repeat(50)
+        )
+    }
+
+    /// A real hyper server, so the response body is a genuine `Incoming` —
+    /// which cannot be constructed directly.
+    async fn fetch_from_origin(
+        body: Vec<u8>,
+        content_type: &'static str,
+        encoding: Option<&'static str>,
+    ) -> (hyper::http::response::Parts, hyper::body::Incoming) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let service = service_fn(move |_req: Request<Incoming>| {
+                    let body = body.clone();
+                    async move {
+                        let mut builder =
+                            Response::builder().status(StatusCode::OK).header(CONTENT_TYPE, content_type);
+                        if let Some(e) = encoding {
+                            builder = builder.header("content-encoding", e);
+                        }
+                        Ok::<_, Infallible>(builder.body(Full::new(Bytes::from(body))).unwrap())
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(tcp), service)
+                    .await;
+            }
+        });
+
+        let tls = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        let client: ProxyClient =
+            Client::builder(TokioExecutor::new()).build(HttpsConnector::from((http, tls.into())));
+
+        let resp = client
+            .get(format!("http://{addr}/").parse().unwrap())
+            .await
+            .unwrap();
+        resp.into_parts()
+    }
+
+    fn parts_with(content_type: &str, encoding: Option<&str>) -> hyper::http::response::Parts {
+        let mut builder = Response::builder().status(StatusCode::OK).header(CONTENT_TYPE, content_type);
+        if let Some(e) = encoding {
+            builder = builder.header("content-encoding", e);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    #[test]
+    fn document_navigations_are_the_only_thing_injected_into() {
+        let html = parts_with("text/html; charset=utf-8", Some("br"));
+        assert!(should_inject_response(&html, true, false));
+        // Not a navigation.
+        assert!(!should_inject_response(&html, false, false));
+        // A bypassed site has no clearance to renew.
+        assert!(!should_inject_response(&html, true, true));
+
+        // Non-HTML, whatever else is true.
+        for ct in ["application/json", "text/javascript", "text/css", "image/png", "image/svg+xml"] {
+            let parts = parts_with(ct, Some("br"));
+            assert!(!should_inject_response(&parts, true, false), "injected into {ct}");
+        }
+
+        // An encoding we can't round-trip must be left alone.
+        let unknown = parts_with("text/html", Some("zstd"));
+        assert!(!should_inject_response(&unknown, true, false));
+        let stacked = parts_with("text/html", Some("br, gzip"));
+        assert!(!should_inject_response(&stacked, true, false));
+
+        // Uncompressed HTML is still injectable.
+        let identity = parts_with("text/html", None);
+        assert!(should_inject_response(&identity, true, false));
+    }
+
+    #[tokio::test]
+    async fn brotli_document_is_decoded_injected_and_re_encoded() {
+        let original = document();
+        let encoded = inject::compress(original.clone().into_bytes(), Encoding::Brotli).unwrap();
+
+        let (parts, body) = fetch_from_origin(encoded, "text/html; charset=utf-8", Some("br")).await;
+        let (out, length) = inject_renewal_script(&parts, body, 1800).await;
+
+        // The response is still Brotli, so a client that asked for it still
+        // gets it — and still decodes.
+        let decoded = inject::decompress(&out, Encoding::Brotli).expect("still brotli");
+        let html = String::from_utf8(decoded).expect("utf8");
+
+        // The script is present, the TTL is the configured one, and the
+        // original document survived intact.
+        assert!(html.contains("__NG_CONFIG__"), "config prelude missing");
+        assert!(html.contains("ttl:1800"), "TTL not rendered in");
+        assert!(html.contains("editor content"), "original content lost");
+        assert!(html.contains("</body>"), "closing tag lost");
+        assert!(
+            html.find("__NG_CONFIG__").unwrap() < html.find("</body>").unwrap(),
+            "script must land inside the body"
+        );
+        // Injected exactly once. Counted via the prelude, since the guard
+        // source itself also mentions __NG_CONFIG__ when it reads the value.
+        assert_eq!(html.matches("<script>window.__NG_CONFIG__=").count(), 1);
+
+        assert_eq!(length, out.len(), "reported length must match the body");
+    }
+
+    #[tokio::test]
+    async fn gzip_document_round_trips_too() {
+        let encoded = inject::compress(document().into_bytes(), Encoding::Gzip).unwrap();
+        let (parts, body) = fetch_from_origin(encoded, "text/html", Some("gzip")).await;
+        let (out, _) = inject_renewal_script(&parts, body, 900).await;
+
+        let html = String::from_utf8(inject::decompress(&out, Encoding::Gzip).unwrap()).unwrap();
+        assert!(html.contains("ttl:900"), "TTL not rendered in");
+        assert!(html.contains("editor content"));
+    }
+
+    #[tokio::test]
+    async fn identity_document_round_trips_too() {
+        let (parts, body) =
+            fetch_from_origin(document().into_bytes(), "text/html", None).await;
+        let (out, _) = inject_renewal_script(&parts, body, 1800).await;
+
+        let html = String::from_utf8(out.to_vec()).unwrap();
+        assert!(html.contains("__NG_CONFIG__"));
+        assert!(html.contains("editor content"));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_encoded_body_is_returned_untouched() {
+        // Decoding will fail; the caller must get the original bytes back
+        // rather than a corrupted or empty response.
+        let garbage = b"\x1b\xffnot brotli at all".to_vec();
+        let (parts, body) = fetch_from_origin(garbage.clone(), "text/html", Some("br")).await;
+        let (out, length) = inject_renewal_script(&parts, body, 1800).await;
+
+        assert_eq!(out.as_ref(), garbage.as_slice(), "body was not passed through");
+        assert_eq!(length, garbage.len());
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_passed_through_intact() {
+        // Over the cap once decoded. It must not be truncated or injected.
+        let huge = format!(
+            "<!doctype html><html><body>{}</body></html>",
+            "<p>padding</p>".repeat(400_000)
+        );
+        assert!(huge.len() > inject::MAX_DECOMPRESSED, "fixture must exceed the cap");
+        let encoded = inject::compress(huge.clone().into_bytes(), Encoding::Brotli).unwrap();
+
+        let (parts, body) = fetch_from_origin(encoded.clone(), "text/html", Some("br")).await;
+        let (out, _) = inject_renewal_script(&parts, body, 1800).await;
+
+        assert_eq!(out.as_ref(), encoded.as_slice(), "oversized body was modified");
+    }
+
+    #[tokio::test]
+    async fn a_json_body_is_never_touched() {
+        let payload = br#"{"posts":[{"id":"1"}]}"#.to_vec();
+        let (parts, body) =
+            fetch_from_origin(payload.clone(), "application/json", Some("br")).await;
+
+        // The pipeline gate must reject it before the body is read.
+        assert!(!should_inject_response(&parts, true, false));
+        assert_eq!(parts.headers.get(CONTENT_TYPE).unwrap(), "application/json");
+        drop(body);
+    }
+
+    #[test]
+    fn document_requests_are_recognised_from_fetch_metadata() {
+        let with = |dest: Option<&str>, accept: Option<&str>| {
+            let mut headers = hyper::HeaderMap::new();
+            if let Some(d) = dest {
+                headers.insert("sec-fetch-dest", HeaderValue::from_str(d).unwrap());
+            }
+            if let Some(a) = accept {
+                headers.insert("accept", HeaderValue::from_str(a).unwrap());
+            }
+            is_document_request(&headers)
+        };
+
+        assert!(with(Some("document"), None));
+        assert!(with(Some("DOCUMENT"), None));
+        // Ghost's editor autosaves: a background call, not a navigation.
+        assert!(!with(Some("empty"), Some("*/*")));
+        assert!(!with(Some("image"), None));
+        assert!(!with(Some("script"), None));
+
+        // Without a hint, fall back to Accept.
+        assert!(with(None, Some("text/html,application/xhtml+xml")));
+        assert!(!with(None, Some("*/*")));
+        assert!(!with(None, None));
     }
 }
