@@ -1,5 +1,5 @@
 #!/bin/bash
-# NekoGuard deployment: k3s + Dashboard (single-node)
+# NekoGuard deployment: k3s (single-node)
 # Run on the server after k3s is installed
 set -euo pipefail
 
@@ -23,12 +23,7 @@ kubectl wait --for=condition=Ready pod -l app=nekoguard -n nekoguard --timeout=1
 kubectl wait --for=condition=Ready pod -l app=nekoguard-certd -n nekoguard --timeout=120s
 echo "NekoGuard deployed"
 
-echo "=== Step 3: Dashboard ==="
-kubectl apply -f k8s/dashboard.yaml
-echo "Dashboard deployed"
-
 echo "=== Done ==="
 kubectl get pods -A
 echo ""
-echo "NekoGuard: https://<NODE_IP>:30443"
-echo "Dashboard: https://<NODE_IP>:30443"
+echo "NekoGuard: https://<NODE_IP>"
