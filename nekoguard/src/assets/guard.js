@@ -329,62 +329,42 @@
     };
   }
 
-  if (NativeXHR) {
-    function GuardedXHR() {
-      var xhr = new NativeXHR();
-      var self = this;
-      var queued = null;
+  if (NativeXHR && NativeXHR.prototype && NativeXHR.prototype.send) {
+    // `send` is patched on the real prototype rather than replaced with a
+    // wrapper constructor.
+    //
+    // Wrapping looked tidier and was wrong: any wrapper has to stand in for
+    // the platform object, and reading a single forwarded accessor off it
+    // (`xhr.onreadystatechange`) reaches the native getter through the
+    // prototype chain with a `this` that is not a real XMLHttpRequest. The
+    // browser throws for exactly that, which took Ghost's whole admin down.
+    // Patching one method keeps the genuine object, so every property,
+    // accessor and event behaves natively; only the moment of sending is
+    // deferred.
+    var nativeSend = NativeXHR.prototype.send;
 
-      // Re-expose the API surface the page expects.
-      ["open", "setRequestHeader", "abort", "getAllResponseHeaders",
-       "getResponseHeader", "overrideMimeType"].forEach(function (name) {
-        self[name] = function () {
-          return xhr[name].apply(xhr, arguments);
-        };
-      });
+    NativeXHR.prototype.send = function (body) {
+      var xhr = this;
 
-      self.send = function (body) {
-        gate({
-          done: function (err) {
-            if (err) {
-              // Surface the failure through the normal XHR events.
+      gate({
+        done: function (err) {
+          if (err) {
+            // Surface the failure the way the platform would: a network error
+            // fires `error` after a completed exchange.
+            try {
+              xhr.readyState = 4;
+            } catch (_) {}
+            try {
               xhr.dispatchEvent(new Event("error"));
-              if (typeof self.onerror === "function") self.onerror(err);
-              return;
+            } catch (_) {
+              if (typeof xhr.onerror === "function") xhr.onerror(err);
             }
-            xhr.send(body);
-          },
-        });
-      };
-
-      ["abort", "error", "load", "loadend", "loadstart", "progress",
-       "readystatechange", "timeout"].forEach(function (name) {
-        xhr.addEventListener(name, function (e) {
-          if (typeof self["on" + name] === "function") self["on" + name](e);
-        });
+            return;
+          }
+          nativeSend.call(xhr, body);
+        },
       });
-
-      Object.defineProperty(self, "readyState", { get: function () { return xhr.readyState; } });
-      Object.defineProperty(self, "status", { get: function () { return xhr.status; } });
-      Object.defineProperty(self, "statusText", { get: function () { return xhr.statusText; } });
-      Object.defineProperty(self, "response", { get: function () { return xhr.response; } });
-      Object.defineProperty(self, "responseText", { get: function () { return xhr.responseText; } });
-      Object.defineProperty(self, "responseType", {
-        get: function () { return xhr.responseType; },
-        set: function (v) { xhr.responseType = v; },
-      });
-      Object.defineProperty(self, "timeout", {
-        get: function () { return xhr.timeout; },
-        set: function (v) { xhr.timeout = v; },
-      });
-      Object.defineProperty(self, "upload", { get: function () { return xhr.upload; } });
-      Object.defineProperty(self, "withCredentials", {
-        get: function () { return xhr.withCredentials; },
-        set: function (v) { xhr.withCredentials = v; },
-      });
-    }
-    GuardedXHR.prototype = NativeXHR.prototype;
-    window.XMLHttpRequest = GuardedXHR;
+    };
   }
 
   /* ── Heartbeat ──────────────────────────────────────────────────────────

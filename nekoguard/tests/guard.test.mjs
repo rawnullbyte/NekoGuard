@@ -106,6 +106,7 @@ function makeBrowser({
 
   // ---- stubbed XHR -------------------------------------------------------
   function StubXHR() {
+    genuine.add(this);
     this._listeners = {};
     this.readyState = 4;
     this.status = 200;
@@ -129,6 +130,37 @@ function makeBrowser({
   StubXHR.prototype.addEventListener = function (name, fn) {
     (this._listeners[name] = this._listeners[name] || []).push(fn);
   };
+  // Browsers throw when a native accessor runs with a `this` that is not a
+  // *genuine* XMLHttpRequest. The check is a brand check on internal state,
+  // NOT `instanceof` — an interceptor that sets
+  // `Wrapper.prototype = XMLHttpRequest.prototype` makes wrapper objects pass
+  // `instanceof` while the browser still throws on them. Modelling this with a
+  // brand set is what makes the regression below meaningful: an
+  // `instanceof`-based stub silently accepts the very wrapper that broke
+  // Ghost's admin.
+  const genuine = new WeakSet();
+  const brandCheck = (self, member) => {
+    if (!genuine.has(self)) {
+      throw new TypeError(
+        `'get ${member}' called on an object that does not implement interface XMLHttpRequest.`
+      );
+    }
+  };
+
+  StubXHR.prototype.addEventListener = function (name, fn) {
+    (this._listeners[name] = this._listeners[name] || []).push(fn);
+  };
+  Object.defineProperty(StubXHR.prototype, "onreadystatechange", {
+    configurable: true,
+    get() {
+      brandCheck(this, "onreadystatechange");
+      return this._onreadystatechange || null;
+    },
+    set(v) {
+      brandCheck(this, "onreadystatechange");
+      this._onreadystatechange = v;
+    },
+  });
   StubXHR.prototype.dispatchEvent = function (e) {
     (this._listeners[e.type] || []).forEach((fn) => fn(e));
   };
@@ -349,6 +381,35 @@ test("a wedged renewal releases the queue instead of hanging it", async () => {
   const err = await outcome;
   assert.ok(err instanceof Error, `expected a failure, got ${err}`);
   assert.match(err.message, /clearance/i);
+});
+
+test("XHR objects stay genuine, with native accessors intact", async () => {
+  // Regression: the interceptor used to replace window.XMLHttpRequest with a
+  // wrapper, then read `self.onreadystatechange` to forward events. That read
+  // reached the native getter with a `this` that was not a real XHR, the
+  // browser threw, and Ghost's admin reported "Server was unreachable".
+  const b = makeBrowser();
+
+  const xhr = new b.window.XMLHttpRequest();
+  assert.ok(
+    xhr instanceof b.window.XMLHttpRequest,
+    "constructed object must be an instance of the exposed constructor"
+  );
+
+  // Every native member must be reachable without throwing.
+  assert.doesNotThrow(() => void xhr.onreadystatechange, "reading onreadystatechange");
+  assert.doesNotThrow(() => {
+    xhr.onreadystatechange = function () {};
+  }, "assigning onreadystatechange");
+  assert.doesNotThrow(() => void xhr.readyState, "reading readyState");
+  assert.doesNotThrow(() => void xhr.responseType, "reading responseType");
+  assert.doesNotThrow(() => void xhr.withCredentials, "reading withCredentials");
+  assert.doesNotThrow(() => xhr.open("GET", "/x"), "open()");
+
+  // And a request on a fresh session still goes straight out.
+  xhr.send();
+  await b.settle();
+  assert.equal(b.nativeSends(), 1, "the request should reach the native send");
 });
 
 test("XHR requests are queued and released like fetch", async () => {
