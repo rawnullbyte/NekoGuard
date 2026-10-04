@@ -294,7 +294,7 @@ fn strip_cookie_domain(cookie: &str) -> String {
 }
 
 /// The renewal script, spliced into documents the origin serves.
-const GUARD_JS: &str = include_str!("assets/guard.js");
+const GUARD_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/guard.min.js"));
 
 /// Whether a request is a navigation — a document a browser will parse and run
 /// scripts in — rather than a subresource or a background call.

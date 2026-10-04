@@ -14,7 +14,20 @@ import { dirname, join } from "node:path";
 import vm from "node:vm";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SOURCE = readFileSync(join(HERE, "..", "src", "assets", "guard.js"), "utf8");
+
+// Which build of the script to exercise.
+//
+// The default is the authored source, so a failure points at readable code.
+// GUARD_JS can point at the build output instead, which is how the minifier is
+// checked: the same suite runs against the minified artifact, so a minification
+// bug that breaks renewal fails the build rather than surfacing in production.
+const SOURCE_PATH =
+  process.env.GUARD_JS || join(HERE, "..", "src", "assets", "guard.js");
+const SOURCE = readFileSync(SOURCE_PATH, "utf8");
+
+if (process.env.GUARD_JS) {
+  console.error(`[guard tests] using ${SOURCE_PATH} (${SOURCE.length} bytes)`);
+}
 
 // Cheap difficulty: the tests run a genuine search, just a short one.
 const BITS = 8;

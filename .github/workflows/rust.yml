@@ -48,3 +48,11 @@ jobs:
 
       - name: Test injected client script
         run: node --test nekoguard/tests/guard.test.mjs
+
+      # The script is delivered minified. Run the same suite against the
+      # minified build so a minifier regression fails here rather than
+      # silently breaking clearance renewal in production.
+      - name: Test the minified injected script
+        run: |
+          GUARD_JS="$(ls -t target/release/build/nekoguard-*/out/guard.min.js | head -1)" \
+            node --test nekoguard/tests/guard.test.mjs

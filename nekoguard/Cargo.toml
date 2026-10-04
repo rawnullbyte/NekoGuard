@@ -43,3 +43,4 @@ flate2 = "1.1.10"
 
 [build-dependencies]
 minify-html = "0.15"
+minify-js = "0.5.6"

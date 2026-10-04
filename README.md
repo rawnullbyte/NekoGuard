@@ -93,6 +93,12 @@ hang a page forever.
 The current TTL and difficulty are rendered into the page from configuration,
 so the client never guesses them.
 
+`src/assets/guard.js` is the authored source — commented, for people reading
+it here. It is minified at build time (15704 → ~5200 bytes) and it is the
+minified artifact that ships, since its size is paid on every page load. The
+Node suite runs against both, so a minifier regression fails the build instead
+of quietly breaking renewal in production.
+
 ### How injection decides
 
 Bodies are only rewritten when **all** of these hold:
