@@ -738,7 +738,7 @@ async fn handle(
             (h, Some(u)) if h != "-" => (h.clone(), u.clone()),
             _ => return Ok(text_resp(StatusCode::NOT_FOUND, "Not found")),
         };
-        return Ok(match embed::favicon(Some(&embed_ctx), &client, &host, &site_upstream).await {
+        return Ok(match embed::favicon(Some(&embed_ctx), &client, &host, &site_upstream, &path).await {
             Some((icon, mime)) => local_resp(StatusCode::OK, mime, icon),
             None => text_resp(StatusCode::NOT_FOUND, "Not found"),
         });
@@ -881,7 +881,7 @@ async fn handle(
     let page = challenge_html(&pow::new_challenge(CHALLENGE_TTL));
     let page = match (&host_header, &upstream) {
         (h, Some(u)) if h != "-" => {
-            embed::inline_into(page, Some(&embed_ctx), &client, h, u).await
+            embed::inline_into(page, Some(&embed_ctx), &client, h, u, &path).await
         }
         // No host to take metadata from, but the marker still has to go.
         _ => embed::clear_marker(page),

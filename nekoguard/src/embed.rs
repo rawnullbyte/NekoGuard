@@ -20,6 +20,7 @@ use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::{Request, StatusCode};
 use regex::{NoExpand, Regex};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, LazyLock};
@@ -97,9 +98,38 @@ struct CachedMeta {
     icon_mime: Option<String>,
 }
 
-/// Redis key holding one origin's metadata.
-fn cache_key(host: &str) -> String {
-    format!("nekoguard:embed:{host}")
+/// Redis key holding one origin path's metadata.
+///
+/// Root keeps the bare host key, so entries written before paths were cached
+/// are still found. Deeper paths get a digest rather than the raw path: it
+/// keeps keys a fixed length and free of characters that need escaping, and a
+/// crawler can't mint unbounded key names through it.
+fn cache_key(host: &str, path: &str) -> String {
+    let path = normalize_path(path);
+    if path == "/" {
+        format!("nekoguard:embed:{host}")
+    } else {
+        format!("nekoguard:embed:{host}:p:{}", path_digest(&path))
+    }
+}
+
+/// A request path reduced to what identifies the document it names.
+///
+/// Query and fragment are dropped: they don't change which page is served,
+/// and keeping them would let one page mint a key per query string.
+fn normalize_path(path: &str) -> String {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    match path {
+        "" => "/".to_string(),
+        p if p.starts_with('/') => p.to_string(),
+        p => format!("/{p}"),
+    }
+}
+
+fn path_digest(path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_bytes());
+    hex::encode(&hasher.finalize()[..8])
 }
 
 impl From<&Meta> for CachedMeta {
@@ -160,9 +190,13 @@ impl EmbedCtx {
 
 /// A Redis error means "cache unavailable", not "no metadata": callers carry
 /// on to the origin rather than surfacing a failure.
-async fn redis_get(redis: &mut redis::aio::ConnectionManager, host: &str) -> Option<Arc<Meta>> {
+async fn redis_get(
+    redis: &mut redis::aio::ConnectionManager,
+    host: &str,
+    path: &str,
+) -> Option<Arc<Meta>> {
     let raw: Option<String> = redis::cmd("GET")
-        .arg(cache_key(host))
+        .arg(cache_key(host, path))
         .query_async(redis)
         .await
         .map_err(|e| log::debug!("[embed] redis GET failed for {host}: {e}"))
@@ -170,7 +204,7 @@ async fn redis_get(redis: &mut redis::aio::ConnectionManager, host: &str) -> Opt
     let raw = raw?;
 
     serde_json::from_str::<CachedMeta>(&raw)
-        .map_err(|e| log::warn!("[embed] unreadable cache entry for {host}: {e}"))
+        .map_err(|e| log::warn!("[embed] unreadable cache entry for {host}{path}: {e}"))
         .ok()
         .map(|cached| Arc::new(cached.into_meta()))
 }
@@ -180,14 +214,15 @@ async fn redis_get(redis: &mut redis::aio::ConnectionManager, host: &str) -> Opt
 async fn redis_set(
     redis: &mut redis::aio::ConnectionManager,
     host: &str,
+    path: &str,
     meta: &Meta,
 ) -> Option<()> {
     let payload = serde_json::to_string(&CachedMeta::from(meta))
-        .map_err(|e| log::warn!("[embed] could not serialize metadata for {host}: {e}"))
+        .map_err(|e| log::warn!("[embed] could not serialize metadata for {host}{path}: {e}"))
         .ok()?;
 
     redis::cmd("SET")
-        .arg(cache_key(host))
+        .arg(cache_key(host, path))
         .arg(payload)
         .arg("EX")
         .arg(CACHE_TTL.as_secs())
@@ -213,9 +248,13 @@ pub(crate) async fn inline_into(
     client: &ProxyClient,
     host: &str,
     upstream: &str,
+    // The address of the page the visitor asked for. The interstitial is
+    // served in place of that page, so its metadata is that page's — not the
+    // site root's.
+    path: &str,
 ) -> String {
     let host = normalize_host(host);
-    let meta = load(&host, ctx, client, upstream, true).await;
+    let meta = load(&host, path, ctx, client, upstream, true).await;
 
     let mut inject = String::new();
     if let Some(meta) = &meta {
@@ -249,11 +288,24 @@ pub(crate) async fn favicon(
     client: &ProxyClient,
     host: &str,
     upstream: &str,
+    path: &str,
 ) -> Option<(Bytes, &'static str)> {
     let host = normalize_host(host);
-    // A miss means this host hasn't served an interstitial within the window,
-    // so fetching now would be work nothing asked for.
-    load(&host, ctx, client, upstream, false).await?.icon.clone()
+    let path = normalize_path(path);
+
+    // The favicon is a property of the site, not the page, so an icon this
+    // path hasn't cached is worth looking for at the root before giving up.
+    if let Some(meta) = load(&host, &path, ctx, client, upstream, false).await {
+        if meta.icon.is_some() {
+            return meta.icon.clone();
+        }
+    }
+    if path != "/" {
+        if let Some(meta) = load(&host, "/", ctx, client, upstream, false).await {
+            return meta.icon.clone();
+        }
+    }
+    None
 }
 
 /// Metadata for `host`: from the local tier, else Redis, else freshly fetched
@@ -266,12 +318,15 @@ pub(crate) async fn favicon(
 /// to an origin that has never served an interstitial.
 async fn load(
     host: &str,
+    path: &str,
     ctx: Option<&EmbedCtx>,
     client: &ProxyClient,
     upstream: &str,
     fetch_on_miss: bool,
 ) -> Option<Arc<Meta>> {
-    if let Some(meta) = local_get(host).await {
+    let path = normalize_path(path);
+
+    if let Some(meta) = local_get(host, &path).await {
         return Some(meta);
     }
 
@@ -280,8 +335,8 @@ async fn load(
     // Read-through: another replica, or this one before a restart, may have
     // already fetched within the window.
     if let Some(conn) = conn.as_mut() {
-        if let Some(meta) = redis_get(conn, host).await {
-            local_put(host, Arc::clone(&meta)).await;
+        if let Some(meta) = redis_get(conn, host, &path).await {
+            local_put(host, &path, Arc::clone(&meta)).await;
             return Some(meta);
         }
     }
@@ -293,64 +348,71 @@ async fn load(
     // Serialise the fetch per host, so a burst for one origin makes a single
     // request rather than one per visitor. Replicas still fetch in parallel —
     // this only covers the visitors landing on one instance.
-    let lock = inflight_lock(host).await;
+    let lock = inflight_lock(host, &path).await;
     let _guard = lock.lock().await;
 
     // A peer may have finished while this task waited for the lock.
-    if let Some(meta) = local_get(host).await {
+    if let Some(meta) = local_get(host, &path).await {
         return Some(meta);
     }
     if let Some(conn) = conn.as_mut() {
-        if let Some(meta) = redis_get(conn, host).await {
-            local_put(host, Arc::clone(&meta)).await;
+        if let Some(meta) = redis_get(conn, host, &path).await {
+            local_put(host, &path, Arc::clone(&meta)).await;
             return Some(meta);
         }
     }
 
-    let meta = Arc::new(fetch(client, host, upstream).await?);
-    local_put(host, Arc::clone(&meta)).await;
+    let meta = Arc::new(fetch(client, host, upstream, &path).await?);
+    local_put(host, &path, Arc::clone(&meta)).await;
     if let Some(conn) = conn.as_mut() {
-        redis_set(conn, host, &meta).await;
+        redis_set(conn, host, &path, &meta).await;
     }
     Some(meta)
 }
 
 /// A locally cached copy, discarded once it's as old as the Redis window — so
 /// a serving replica can never outlive the entry it was minted from.
-async fn local_get(host: &str) -> Option<Arc<Meta>> {
+async fn local_get(host: &str, path: &str) -> Option<Arc<Meta>> {
+    let key = cache_key(host, path);
     let mut cache = LOCAL.lock().await;
-    match cache.get(host) {
+    match cache.get(&key) {
         Some(entry) if entry.fetched.elapsed() < CACHE_TTL => Some(Arc::clone(&entry.meta)),
         Some(_) => {
-            cache.remove(host);
+            cache.remove(&key);
             None
         }
         None => None,
     }
 }
 
-async fn local_put(host: &str, meta: Arc<Meta>) {
+async fn local_put(host: &str, path: &str, meta: Arc<Meta>) {
     LOCAL
         .lock()
         .await
-        .insert(host.to_string(), Cached { meta, fetched: Instant::now() });
+        .insert(cache_key(host, path), Cached { meta, fetched: Instant::now() });
 }
 
 /// Resolve the per-host fetch lock, so a burst for one origin makes one
 /// request rather than one per visitor.
-async fn inflight_lock(host: &str) -> Arc<Mutex<()>> {
+async fn inflight_lock(host: &str, path: &str) -> Arc<Mutex<()>> {
+    let key = cache_key(host, path);
     let mut inflight = INFLIGHT.lock().await;
     Arc::clone(
         inflight
-            .entry(host.to_string())
+            .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(()))),
     )
 }
 
 /// Fetch and scrape one origin. `None` means the document could not be
 /// retrieved; a document that merely lacks metadata is still `Some`.
-async fn fetch(client: &ProxyClient, host: &str, upstream: &str) -> Option<Meta> {
-    let document = match fetch_html(client, host, upstream).await {
+async fn fetch(
+    client: &ProxyClient,
+    host: &str,
+    upstream: &str,
+    path: &str,
+) -> Option<Meta> {
+    let document = match fetch_html(client, host, upstream, path).await {
         Some(document) => document,
         None => {
             log::debug!("[embed] no origin document for {host}");
@@ -370,8 +432,13 @@ async fn fetch(client: &ProxyClient, host: &str, upstream: &str) -> Option<Meta>
 
 /// Retrieve the origin's root document as HTML, following up to `MAX_HOPS`
 /// same-origin redirects — `/` → `/en/` and friends are common.
-async fn fetch_html(client: &ProxyClient, host: &str, upstream: &str) -> Option<String> {
-    let mut path = "/".to_string();
+async fn fetch_html(
+    client: &ProxyClient,
+    host: &str,
+    upstream: &str,
+    path: &str,
+) -> Option<String> {
+    let mut path = normalize_path(path);
 
     for _ in 0..MAX_HOPS {
         let req = build_get(host, upstream, &path)?;
@@ -1161,7 +1228,7 @@ mod fetch_tests {
         let host = "inline.example";
         let upstream = origin.upstream();
 
-        let out = inline_into(page(), None, &client, host, &upstream).await;
+        let out = inline_into(page(), None, &client, host, &upstream, "/").await;
 
         assert!(out.contains("<title>Origin Title</title>"), "{out}");
         assert!(out.contains("og:description"), "{out}");
@@ -1179,12 +1246,12 @@ mod fetch_tests {
         assert!(hits.iter().all(|(_, h)| h == host), "{hits:?}");
 
         // The favicon is cached alongside the rest.
-        let (icon, mime) = favicon(None, &client, host, &upstream).await.expect("favicon");
+        let (icon, mime) = favicon(None, &client, host, &upstream, "/").await.expect("favicon");
         assert_eq!(mime, "image/x-icon");
         assert_eq!(icon.as_ref(), ICON);
 
         // A second render inside the window must not touch the origin again.
-        let _ = inline_into(page(), None, &client, host, &upstream).await;
+        let _ = inline_into(page(), None, &client, host, &upstream, "/").await;
         assert_eq!(origin.hits().await.len(), 2, "cache missed on re-render");
     }
 
@@ -1207,7 +1274,7 @@ mod fetch_tests {
 
         let client = test_client();
         let host = "redirect.example";
-        let out = inline_into(page(), None, &client, &host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, &host, &origin.upstream(), "/").await;
 
         assert!(out.contains("<title>Origin Title</title>"), "{out}");
         // The document, the redirect target, then the favicon it declares.
@@ -1230,7 +1297,7 @@ mod fetch_tests {
         let host = "crossorigin.example";
         // Unreachable origins aren't cached, so this returns promptly with
         // the host as the title rather than the placeholder's.
-        let out = inline_into(page(), None, &client, host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, host, &origin.upstream(), "/").await;
 
         assert!(out.contains(&format!("<title>{host}</title>")), "{out}");
         assert_eq!(origin.paths().await, vec!["/"], "redirect was followed off-origin");
@@ -1257,9 +1324,147 @@ mod fetch_tests {
         let host = "svgicon.example";
         let upstream = origin.upstream();
 
-        let out = inline_into(page(), None, &client, host, &upstream).await;
+        let out = inline_into(page(), None, &client, host, &upstream, "/").await;
         assert!(!out.contains("/__ng/favicon.ico"), "svg served as favicon: {out}");
-        assert!(favicon(None, &client, host, &upstream).await.is_none());
+        assert!(favicon(None, &client, host, &upstream, "/").await.is_none());
+    }
+
+    /// The whole point of path-scoped caching: a subpage's interstitial must
+    /// describe that subpage, not the site root. Before this, every path on a
+    /// domain rendered with the homepage's title and description.
+    #[tokio::test]
+    async fn a_subpage_gets_its_own_metadata_not_the_roots() {
+        let origin = start_origin(|path| match path {
+            "/" => (
+                200,
+                vec![("content-type", "text/html".into())],
+                br#"<head><title>Site Home</title>
+                    <meta name="description" content="the homepage">
+                    <meta property="og:type" content="website"></head>"#
+                    .to_vec(),
+            ),
+            "/a-post/" => (
+                200,
+                vec![("content-type", "text/html".into())],
+                br#"<head><title>A Post</title>
+                    <meta name="description" content="a specific post">
+                    <meta property="og:type" content="article"></head>"#
+                    .to_vec(),
+            ),
+            _ => (404, vec![], Vec::new()),
+        })
+        .await;
+
+        let client = test_client();
+        let host = "paths.example";
+        let upstream = origin.upstream();
+
+        let out = inline_into(page(), None, &client, host, &upstream, "/a-post/").await;
+        assert!(out.contains("<title>A Post</title>"), "{out}");
+        assert!(out.contains("a specific post"), "{out}");
+        assert!(out.contains(r#"content="article""#), "{out}");
+        assert!(!out.contains("Site Home"), "root metadata leaked in: {out}");
+        assert!(!out.contains("the homepage"), "root description leaked in: {out}");
+
+        assert_eq!(origin.paths().await, vec!["/a-post/"]);
+    }
+
+    /// Root and a subpage are separate cache entries: asking for one must not
+    /// answer from the other.
+    #[tokio::test]
+    async fn root_and_subpage_are_cached_separately() {
+        let origin = start_origin(|path| match path {
+            "/" => (
+                200,
+                vec![("content-type", "text/html".into())],
+                b"<head><title>Site Home</title></head>".to_vec(),
+            ),
+            "/a-post/" => (
+                200,
+                vec![("content-type", "text/html".into())],
+                b"<head><title>A Post</title></head>".to_vec(),
+            ),
+            _ => (404, vec![], Vec::new()),
+        })
+        .await;
+
+        let client = test_client();
+        let host = "separate.example";
+        let upstream = origin.upstream();
+
+        let root = inline_into(page(), None, &client, host, &upstream, "/").await;
+        let post = inline_into(page(), None, &client, host, &upstream, "/a-post/").await;
+
+        assert!(root.contains("<title>Site Home</title>"), "{root}");
+        assert!(post.contains("<title>A Post</title>"), "{post}");
+
+        // Each was fetched once; a second pass is served from cache.
+        let after_first = origin.paths().await;
+        let _ = inline_into(page(), None, &client, host, &upstream, "/a-post/").await;
+        let _ = inline_into(page(), None, &client, host, &upstream, "/").await;
+        assert_eq!(origin.paths().await, after_first, "cache missed on re-render");
+    }
+
+    /// A path that redirects is followed, and its metadata is the
+    /// destination's — resolved within the same origin.
+    #[tokio::test]
+    async fn a_redirecting_subpage_is_resolved_through_the_redirect() {
+        let origin = start_origin(|path| match path {
+            "/old/" => (301, vec![("location", "/new/".into())], Vec::new()),
+            "/new/" => (
+                200,
+                vec![("content-type", "text/html".into())],
+                b"<head><title>Moved Post</title></head>".to_vec(),
+            ),
+            _ => (404, vec![], Vec::new()),
+        })
+        .await;
+
+        let client = test_client();
+        let host = "moved.example";
+        let out = inline_into(page(), None, &client, host, &origin.upstream(), "/old/").await;
+
+        assert!(out.contains("<title>Moved Post</title>"), "{out}");
+        assert_eq!(origin.paths().await, vec!["/old/", "/new/"]);
+    }
+
+    /// A path the origin has nothing for falls back to the host, rather than
+    /// rendering the placeholder's own title.
+    #[tokio::test]
+    async fn an_unknown_path_falls_back_to_the_host() {
+        let origin = start_origin(|_| (404, vec![], Vec::new())).await;
+        let client = test_client();
+        let host = "nopage.example";
+
+        let out = inline_into(page(), None, &client, host, &origin.upstream(), "/missing/").await;
+        assert!(out.contains(&format!("<title>{host}</title>")), "{out}");
+    }
+
+    /// Query strings and fragments name the same document, so they must not
+    /// mint separate cache entries — otherwise one page could fill the cache.
+    #[test]
+    fn paths_are_normalised_before_they_become_keys() {
+        assert_eq!(normalize_path("/a-post/"), "/a-post/");
+        assert_eq!(normalize_path("/a-post/?utm_source=x"), "/a-post/");
+        assert_eq!(normalize_path("/a-post/#comments"), "/a-post/");
+        assert_eq!(normalize_path(""), "/");
+        assert_eq!(normalize_path("post"), "/post");
+
+        // The same document reached three ways collapses to one key.
+        let a = cache_key("x.test", "/p/?a=1");
+        let b = cache_key("x.test", "/p/");
+        let c = cache_key("x.test", "/p/#frag");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+
+        // Different documents stay distinct.
+        assert_ne!(cache_key("x.test", "/one/"), cache_key("x.test", "/two/"));
+        assert_ne!(cache_key("x.test", "/"), cache_key("x.test", "/one/"));
+        // Root keeps the bare host key.
+        assert_eq!(cache_key("x.test", "/"), "nekoguard:embed:x.test");
+        // Keys stay fixed-length regardless of path depth.
+        let deep = format!("/{}", "very/deep/".repeat(80));
+        assert!(cache_key("x.test", &deep).len() < 64);
     }
 
     #[tokio::test]
@@ -1274,7 +1479,7 @@ mod fetch_tests {
 
         let client = test_client();
         let host = "jsononly.example";
-        let out = inline_into(page(), None, &client, host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, host, &origin.upstream(), "/").await;
         assert!(
             out.contains(&format!("<title>{host}</title>")),
             "metadata was scraped from a non-HTML response: {out}"
@@ -1290,7 +1495,7 @@ mod fetch_tests {
 
         let client = test_client();
         let host = "notype.example";
-        let out = inline_into(page(), None, &client, host, &origin.upstream()).await;
+        let out = inline_into(page(), None, &client, host, &origin.upstream(), "/").await;
         assert!(
             out.contains(&format!("<title>{host}</title>")),
             "metadata was scraped without a declared content type: {out}"
@@ -1320,9 +1525,9 @@ mod fetch_tests {
         let host = "htmlicon.example";
         let upstream = origin.upstream();
 
-        let out = inline_into(page(), None, &client, host, &upstream).await;
+        let out = inline_into(page(), None, &client, host, &upstream, "/").await;
         assert!(!out.contains("/__ng/favicon.ico"), "served HTML as an icon: {out}");
-        assert!(favicon(None, &client, host, &upstream).await.is_none());
+        assert!(favicon(None, &client, host, &upstream, "/").await.is_none());
     }
 }
 
@@ -1625,7 +1830,7 @@ mod redis_tests {
         let client = test_client();
         let host = "writes.example";
 
-        let _ = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+        let _ = inline_into(page(), Some(&ctx), &client, host, &upstream, "/").await;
 
         let set = store
             .commands()
@@ -1665,14 +1870,14 @@ mod redis_tests {
             icon_mime: Some("image/png".into()),
         };
         store
-            .seed(&cache_key(host), &serde_json::to_string(&seeded).unwrap())
+            .seed(&cache_key(host, "/"), &serde_json::to_string(&seeded).unwrap())
             .await;
 
         // Origin is serving *different* content; if it were consulted the
         // title would give it away.
         *body.lock().await = HTML_TWO;
 
-        let out = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+        let out = inline_into(page(), Some(&ctx), &client, host, &upstream, "/").await;
 
         assert!(out.contains("<title>Seeded Title</title>"), "{out}");
         assert!(out.contains("seeded description"), "{out}");
@@ -1696,7 +1901,7 @@ mod redis_tests {
 
         store
             .seed(
-                &cache_key(host),
+                &cache_key(host, "/"),
                 &serde_json::to_string(&CachedMeta {
                     title: Some("T".into()),
                     tags: vec![],
@@ -1707,7 +1912,7 @@ mod redis_tests {
             )
             .await;
 
-        let (bytes, mime) = favicon(Some(&ctx), &client, host, &upstream)
+        let (bytes, mime) = favicon(Some(&ctx), &client, host, &upstream, "/")
             .await
             .expect("favicon from cache");
         assert_eq!(&bytes[..], b"cached-icon");
@@ -1724,7 +1929,7 @@ mod redis_tests {
         let ctx = ctx_for(redis).await;
         let client = test_client();
 
-        assert!(favicon(Some(&ctx), &client, "neverfetched.example", &upstream)
+        assert!(favicon(Some(&ctx), &client, "neverfetched.example", &upstream, "/")
             .await
             .is_none());
         assert!(store.keys_set().await.is_empty(), "an unrequested fetch was cached");
@@ -1742,7 +1947,7 @@ mod redis_tests {
 
         store
             .seed(
-                &cache_key(host),
+                &cache_key(host, "/"),
                 &serde_json::to_string(&CachedMeta {
                     title: Some("T".into()),
                     tags: vec![r#"<meta name="description" content="d">"#.into()],
@@ -1753,9 +1958,9 @@ mod redis_tests {
             )
             .await;
 
-        assert!(favicon(Some(&ctx), &client, host, &upstream).await.is_none());
+        assert!(favicon(Some(&ctx), &client, host, &upstream, "/").await.is_none());
         // The rest of the entry still renders.
-        let out = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+        let out = inline_into(page(), Some(&ctx), &client, host, &upstream, "/").await;
         assert!(out.contains("<title>T</title>"), "{out}");
         assert!(!out.contains(FAVICON_LINK), "{out}");
     }
@@ -1769,12 +1974,12 @@ mod redis_tests {
         let client = test_client();
         let host = "corrupt.example";
 
-        store.seed(&cache_key(host), "{not json").await;
+        store.seed(&cache_key(host, "/"), "{not json").await;
 
-        let out = inline_into(page(), Some(&ctx), &client, host, &upstream).await;
+        let out = inline_into(page(), Some(&ctx), &client, host, &upstream, "/").await;
         assert!(out.contains("First Title"), "{out}");
         // ...and the bad value is overwritten with a good one.
-        let stored = store.get(&cache_key(host)).await.unwrap();
+        let stored = store.get(&cache_key(host, "/")).await.unwrap();
         assert!(serde_json::from_str::<CachedMeta>(&stored).is_ok());
     }
 
@@ -1795,14 +2000,14 @@ mod redis_tests {
             Ok(m) => m,
             // ConnectionManager connects lazily; a failure here is equally fine.
             Err(_) => {
-                let out = inline_into(page(), None, &client, "deadredis.example", &upstream).await;
+                let out = inline_into(page(), None, &client, "deadredis.example", &upstream, "/").await;
                 assert!(out.contains("First Title"), "{out}");
                 return;
             }
         };
         let ctx = EmbedCtx::new(manager);
 
-        let out = inline_into(page(), Some(&ctx), &client, "deadredis.example", &upstream).await;
+        let out = inline_into(page(), Some(&ctx), &client, "deadredis.example", &upstream, "/").await;
         assert!(out.contains("First Title"), "{out}");
     }
 
@@ -1825,7 +2030,7 @@ mod redis_tests {
 
     #[test]
     fn cache_key_is_namespaced_and_host_scoped() {
-        assert_eq!(cache_key("example.com"), "nekoguard:embed:example.com");
-        assert_ne!(cache_key("a.example"), cache_key("b.example"));
+        assert_eq!(cache_key("example.com", "/"), "nekoguard:embed:example.com");
+        assert_ne!(cache_key("a.example", "/"), cache_key("b.example", "/"));
     }
 }

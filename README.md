@@ -136,12 +136,25 @@ its upstream and lifts out:
 - descriptive `<meta>` tags — `description`, OpenGraph and Twitter cards
 - the favicon, declared in the page as `/__ng/favicon.ico`
 
-Everything is cached per host in **Redis** for **5 minutes**, keyed
-`nekoguard:embed:<host>`, so the cost of a busy or bot-heavy host doesn't scale
-with its traffic — and so replicas share one cache. On a miss a worker fetches
-the origin itself and writes the entry back; within a window the origin is only
-touched again once the entry expires. A fetch that fails is not cached, so the
-next visitor retries.
+Metadata is cached per **host and path** in Redis for **5 minutes**, so a
+subpage's interstitial describes that subpage rather than the site root. Keys
+are `nekoguard:embed:<host>` for the root and
+`nekoguard:embed:<host>:p:<digest>` for anything deeper — a digest keeps keys a
+fixed length and free of characters needing escapes.
+
+Paths are normalised before they become keys: query strings and fragments name
+the same document, so `/post/?utm_source=x` and `/post/` share an entry.
+Otherwise a single page could mint unbounded cache keys through its query
+string.
+
+The cost of correctness here is that NekoGuard fetches *per distinct page*, not
+per origin — a busy host with many pages costs proportionally more upstream
+requests. Bounded by the 5-minute window, and only for pages that actually
+receive challenge traffic.
+
+On a miss a worker fetches the origin itself and writes the entry back; within
+a window the origin is only touched again once the entry expires. A fetch that
+fails is not cached, so the next visitor retries.
 
 Each process also keeps a short-lived copy in front of Redis, since an
 at-capacity instance renders an interstitial for every visitor and the data
@@ -154,6 +167,8 @@ per window rather than one per visitor.
 The favicon is only fetched for a host that has already served an
 interstitial: asking for `/__ng/favicon.ico` on an uncached host returns 404
 without touching the origin, so it can't be used to drive traffic upstream.
+An icon is a property of the site rather than the page, so if the requested
+path cached none, the root's is used.
 
 Two details worth knowing:
 
@@ -352,7 +367,7 @@ url = "redis://127.0.0.1:6379"
 
 - `nekoguard:secret` — HMAC signing secret (shared across all replicas)
 - `nekoguard:rl:<ip>` — Rate limit token bucket per IP (1 hour TTL)
-- `nekoguard:embed:<host>` — Origin metadata for the PoW interstitial (5 min TTL)
+- `nekoguard:embed:<host>[:p:<digest>]` — Per-page metadata for the PoW interstitial (5 min TTL)
 - `nekoguard:cert:<domain>` — Certs from certd (loaded on NekoGuard startup)
 
 ---
@@ -466,7 +481,7 @@ NekoGuard does **not** communicate with certd directly over HTTP — it reads ce
 | `nekoguard:cert:<domain>` | JSON `{cert_pem, key_pem}` | None (persists) |
 | `nekoguard:secret` | HMAC signing secret | None (persists) |
 | `nekoguard:rl:<ip>` | Rate limit bucket `{tokens, last_refill_ms}` | 1 hour |
-| `nekoguard:embed:<host>` | Interstitial metadata `{title, tags, icon, icon_mime}` | 5 minutes |
+| `nekoguard:embed:<host>[:p:<digest>]` | Interstitial metadata `{title, tags, icon, icon_mime}` | 5 minutes |
 
 ---
 
