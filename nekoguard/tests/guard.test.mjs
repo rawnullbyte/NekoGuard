@@ -312,16 +312,25 @@ test("an expired session queues the request, then releases it", async () => {
   await b.sleep(ttl * 1000 + 60_000);
   const beforeRenewals = b.renewals();
 
-  const pending = b.window.fetch("/ghost/api/admin/posts");
+  // The rejection handler is attached up front so the promise is never
+  // briefly unhandled, which the test runner treats as a failure.
+  const outcome = b.window.fetch("/ghost/api/admin/posts").then(
+    () => "released",
+    (err) => err
+  );
 
   // Checked before anything drains: the request must be held, not sent, and
-  // it must have kicked off a renewal rather than waiting on the heartbeat.
+  // it must have kicked off a renewal rather than waiting for the heartbeat.
   assert.equal(b.fetchCount(), 0, "request must be held while expired");
   assert.ok(b.renewals() > beforeRenewals, "a request on a dead cookie should kick a renewal");
 
-  await b.advance(31_000);
-  await pending;
+  // Enough simulated time for the solve to finish, but well short of the 30s
+  // queue timeout — advancing past it makes the test race the timeout, and
+  // which wins then depends on machine speed.
+  await b.advance(1_000);
+  const result = await outcome;
 
+  assert.equal(result, "released", `request was not released cleanly: ${result}`);
   assert.equal(b.fetchCount(), 1, "request should be released after renewal");
 });
 
@@ -350,14 +359,20 @@ test("waking from system sleep renews before releasing anything", async () => {
   await b.sleep(ttl * 1000 + 10 * 60_000);
 
   // A request arrives immediately on wake, on the dead cookie.
-  const pending = b.window.fetch("/ghost/api/admin/posts").catch(() => "released");
+  const outcome = b.window.fetch("/ghost/api/admin/posts").then(
+    () => "released",
+    (err) => err
+  );
   assert.equal(b.fetchCount(), 0, "must not release on a lapsed cookie");
 
-  // The first heartbeat notices the gap and renews, releasing the queue.
-  await b.advance(31_000);
-  await pending;
+  // Renewal starts as soon as the request is held, so this needs only enough
+  // time for the solve — not the 30s queue timeout, which would make the test
+  // race it.
+  await b.advance(1_000);
+  const result = await outcome;
 
   assert.ok(b.renewals() >= 1, "wake-up must trigger renewal");
+  assert.equal(result, "released", `request was not released cleanly: ${result}`);
   assert.equal(b.fetchCount(), 1, "the held request should be released after renewal");
 });
 
@@ -421,7 +436,8 @@ test("XHR requests are queued and released like fetch", async () => {
   xhr.send("payload");
   assert.equal(b.nativeSends(), 0, "XHR must be held while expired");
 
-  await b.advance(31_000);
+  // Enough for the solve; short of the queue timeout so the two can't race.
+  await b.advance(1_000);
   assert.equal(b.nativeSends(), 1, "XHR should be released after renewal");
 });
 
