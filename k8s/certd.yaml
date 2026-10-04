@@ -5,6 +5,13 @@ metadata:
   namespace: nekoguard
 spec:
   replicas: 1
+  # `hostNetwork` below means the pod binds :8443 on the host directly. With
+  # the default RollingUpdate the replacement pod starts and binds before the
+  # old one has exited, so even a single-replica rollout crash-loops with
+  # "Address already in use" until the backoff lets it win. Recreate tears the
+  # old pod down first, which is the only strategy that works with a host port.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: nekoguard-certd
