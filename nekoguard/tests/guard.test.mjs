@@ -40,6 +40,7 @@ function makeBrowser({
   solveWorks = true,
   renewalHangs = false,
   heartbeat = 30_000,
+  realHashing = false,
 } = {}) {
   const state = {
     now: START,
@@ -49,6 +50,8 @@ function makeBrowser({
     renewals: 0,       // /__ng/challenge calls
     verified: 0,       // /__ng/verify calls
     nativeSends: 0,    // XHRs that actually went out
+    lastNonce: null,   // nonce from the most recent verify call
+    lastChallenge: null,
     warned: [],
     target: START,     // clock time the harness is settling towards
     events: 0,         // monotonic count of observable activity
@@ -61,8 +64,30 @@ function makeBrowser({
   };
   FakeDate.now = () => state.now;
 
+  // Solving is stubbed to succeed on the first nonce by default.
+  //
+  // The alternative — running the real search and inferring completion from
+  // "the page looks idle" — makes every test depend on how fast the machine
+  // schedules a chain of awaits, which fails under CI load. The queue, expiry
+  // and sleep logic being tested here doesn't care how long a solve takes, so
+  // the solve is made instant and the search itself is covered separately by
+  // `finds a genuine solution with the real hash function`.
+  const realDigest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle);
+  const zeroHash = new Uint8Array(32).buffer; // every bit zero: meets any target
+
+  const digest = (algorithm, data) => {
+    if (realHashing) {
+      state.events++;
+      return realDigest(algorithm, data);
+    }
+    state.events++;
+    return Promise.resolve(zeroHash);
+  };
+
+  const countingCrypto = { ...globalThis.crypto, subtle: { digest } };
+
   const sandbox = {
-    crypto: globalThis.crypto,
+    crypto: countingCrypto,
     TextEncoder,
     Blob: globalThis.Blob,
     Promise,
@@ -183,6 +208,11 @@ function makeBrowser({
     if (url === "/__ng/verify") {
       state.verified++;
       state.events++;
+      try {
+        const body = JSON.parse(init.body);
+        state.lastNonce = body.nonce;
+        state.lastChallenge = body.challenge;
+      } catch (_) {}
       if (!solveWorks) return Promise.resolve({ ok: false, status: 403 });
       return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true }) });
     }
@@ -270,6 +300,9 @@ function makeBrowser({
     renewals: () => state.renewals,
     verified: () => state.verified,
     nativeSends: () => state.nativeSends,
+    verified: () => state.verified,
+    lastNonce: () => state.lastNonce,
+    lastChallenge: () => state.lastChallenge,
   };
 }
 
@@ -482,6 +515,39 @@ test("a failing solve does not leave requests queued forever", async () => {
   // beat hanging.
   const err = await outcome;
   assert.ok(err instanceof Error, `expected a failure, got ${err}`);
+});
+
+test("finds a genuine solution with the real hash function", async () => {
+  // The other tests stub the solve, so the actual search is exercised here:
+  // the same sha256(challenge || nonce), hex, `bits` leading zero bits the
+  // interstitial uses. The nonce handed to /__ng/verify must genuinely meet
+  // the target, which the server-side check would reject otherwise.
+  const b = makeBrowser({ ttl: 60, realHashing: true });
+
+  // Driven explicitly rather than through `settle`: a real search is a long
+  // chain of awaited digests, and letting it run to completion is clearer
+  // than inferring it from an idleness heuristic.
+  for (let i = 0; i < 20_000 && b.verified() === 0; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(b.verified() >= 1, "renewal should have completed a real solve");
+
+  const nonce = b.lastNonce();
+  assert.ok(nonce !== null && /^\d+$/.test(nonce), `nonce should be a decimal string, got ${nonce}`);
+
+  const challenge = b.lastChallenge();
+  const digest = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(challenge + nonce)
+  );
+  const hex = [...new Uint8Array(digest)].map((x) => x.toString(16).padStart(2, "0")).join("");
+  const bits = BITS;
+  const full = Math.floor(bits / 4);
+  const rem = bits % 4;
+  const meets =
+    hex.slice(0, full) === "0".repeat(full) &&
+    (rem === 0 || parseInt(hex[full], 16) < 1 << (4 - rem));
+  assert.ok(meets, `nonce ${nonce} does not meet ${bits} bits: ${hex}`);
 });
 
 test("requests are not held on a valid session even under repeated ticks", async () => {
